@@ -13,13 +13,13 @@
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │ Astra Pro / │     │ semantic_cloud   │     │  semantic_map    │
-│ RealSense   │────▶│ _node            │────▶│  _node           │
-│ (RGB-D)     │     │ YOLO推理+语义着色  │     │ TF累积+体素滤波   │
+│ RealSense   │───▶│ _node            │───▶│  _node           │
+│ (RGB-D)     │     │ YOLO推理+语义着色 │     │ TF累积+体素滤波   │
 └──────┬──────┘     └──────────────────┘     └────────┬─────────┘
        │                                              │
        │            ┌──────────────────┐              ▼
        │            │ rgbd_odometry    │     /semantic_vslam/
-       └───────────▶│ (官方 rtabmap)    │     semantic_map_cloud  (3D 语义地图)
+       └──────────▶│ (官方 rtabmap)    │     semantic_map_cloud  (3D 语义地图)
                     └────────┬─────────┘     grid_map             (2D 栅格地图)
                              │
                     ┌────────▼─────────┐
