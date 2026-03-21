@@ -1,7 +1,7 @@
 # Semantic VSLAM
 
 > **基于 YOLOv8-seg + RTAB-Map 的实时语义视觉 SLAM 系统**
->
+> V2 分支已开放
 > 目标硬件: NVIDIA Jetson Orin Nano 8GB | 语言: C++ / CUDA | 框架: ROS 2 Humble
 
 将 YOLOv8 实例分割与 RTAB-Map 视觉 SLAM 融合，在 RGB-D 相机输入上实时生成**语义着色的 3D 点云地图**和 **2D 占据栅格地图**，为下游导航和场景理解提供语义感知能力。
