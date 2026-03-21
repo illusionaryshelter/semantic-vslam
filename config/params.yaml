@@ -1,0 +1,45 @@
+# =============================================================================
+# Semantic VSLAM 参数配置
+# =============================================================================
+# 使用方法:
+#   ros2 launch semantic_vslam semantic_slam.launch.py
+#   所有参数从此文件加载, 无需在命令行指定
+# =============================================================================
+
+# ---- Launch 控制 (这些由 launch.py 读取, 非 ROS param) ----
+launch:
+  engine_path: "models/yolov8n-seg.engine"   # TensorRT engine 路径
+  launch_camera: true                         # 是否启动 Astra Pro 驱动
+  rviz: false                                 # 是否启动 RViz2
+  database_path: "/tmp/semantic_slam.db"      # RTAB-Map 数据库路径
+
+# ---- Topic 名称 ----
+topics:
+  rgb: "/camera/color/image_raw"
+  depth: "/camera/depth/image_raw"
+  camera_info: "/camera/color/camera_info"
+
+# ---- 语义点云节点 (semantic_cloud_node) ----
+semantic_cloud_node:
+  ros__parameters:
+    conf_thresh: 0.4          # YOLO 置信度阈值 (0.0-1.0)
+    iou_thresh: 0.45          # NMS IoU 阈值
+    depth_scale: 0.001        # 深度缩放 (Astra Pro: 0.001 = mm→m)
+
+# ---- 语义地图累积节点 (semantic_map_node) ----
+semantic_map_node:
+  ros__parameters:
+    # 地图参数
+    target_frame: "map"       # 累积点云的目标坐标系
+    voxel_size: 0.02          # 体素滤波尺寸 (m), 越小越精细
+    max_clouds: 150           # 滑动窗口帧数, 越大地图越大但越慢
+    cloud_decimation: 3       # 输入点云抽稀倍率
+
+    # 2D 栅格参数
+    publish_rate: 1.0         # 地图发布频率 (Hz)
+    grid_cell_size: 0.05      # 栅格分辨率 (m)
+    grid_min_height: 0.1      # 障碍物最低高度 (m), 低于此视为地面
+    grid_max_height: 2.0      # 障碍物最高高度 (m)
+
+    # 栅格输出模式: "occupancy" = OccupancyGrid, "image" = 彩色语义图
+    grid_mode: "image"

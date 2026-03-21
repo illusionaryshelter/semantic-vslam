@@ -181,14 +181,18 @@ def generate_launch_description():
             package='semantic_vslam',
             executable='semantic_cloud_node',
             name='semantic_cloud_node',
-            parameters=[{
-                'engine_path':    LaunchConfiguration('engine_path'),
-                'rgb_topic':      LaunchConfiguration('rgb_topic'),
-                'depth_topic':    LaunchConfiguration('depth_topic'),
-                'cam_info_topic': LaunchConfiguration('cam_info_topic'),
-                'conf_thresh':    LaunchConfiguration('conf_thresh'),
-                'depth_scale':    0.001,
-            }],
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+                {
+                    'engine_path':    LaunchConfiguration('engine_path'),
+                    'rgb_topic':      LaunchConfiguration('rgb_topic'),
+                    'depth_topic':    LaunchConfiguration('depth_topic'),
+                    'cam_info_topic': LaunchConfiguration('cam_info_topic'),
+                },
+            ],
             output='screen',
         ),
 
@@ -202,13 +206,12 @@ def generate_launch_description():
             package='semantic_vslam',
             executable='semantic_map_node',
             name='semantic_map_node',
-            parameters=[{
-                'target_frame':     'map',
-                'voxel_size':       0.02,
-                'max_clouds':       150,     # 保留最近 150 帧
-                'cloud_decimation': 3,
-                'publish_rate':     1.0,
-            }],
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+            ],
             output='screen',
         ),
     ])

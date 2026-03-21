@@ -11,6 +11,8 @@
 #include "semantic_vslam/semantic_map_node.hpp"
 #include "semantic_vslam/semantic_colors.hpp"
 
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
@@ -74,6 +76,7 @@ SemanticMapNode::SemanticMapNode()
   this->declare_parameter<double>("grid_cell_size", 0.05);
   this->declare_parameter<double>("grid_min_height", 0.1);
   this->declare_parameter<double>("grid_max_height", 2.0);
+  this->declare_parameter<std::string>("grid_mode", "image");
 
   target_frame_ = this->get_parameter("target_frame").as_string();
   voxel_size_ = this->get_parameter("voxel_size").as_double();
@@ -83,6 +86,7 @@ SemanticMapNode::SemanticMapNode()
   grid_cell_size_ = this->get_parameter("grid_cell_size").as_double();
   grid_min_height_ = this->get_parameter("grid_min_height").as_double();
   grid_max_height_ = this->get_parameter("grid_max_height").as_double();
+  grid_mode_ = this->get_parameter("grid_mode").as_string();
 
   // ---- TF2 ----
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -93,11 +97,18 @@ SemanticMapNode::SemanticMapNode()
       "/semantic_vslam/semantic_cloud", 5,
       std::bind(&SemanticMapNode::cloudCallback, this, std::placeholders::_1));
 
-  // ---- 发布 3D 语义地图 + 2D 栅格地图 ----
+  // ---- 发布 3D 语义地图 ----
   map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/semantic_vslam/semantic_map_cloud", 1);
-  grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
-      "/semantic_vslam/grid_map", 1);
+
+  // ---- 发布 2D 栅格地图 (根据 grid_mode 选择输出格式) ----
+  if (grid_mode_ == "image") {
+    grid_img_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+        "/semantic_vslam/grid_map_image", 1);
+  } else {
+    grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+        "/semantic_vslam/grid_map", 1);
+  }
 
   // ---- 定时发布 ----
   auto period_ms = static_cast<int>(1000.0 / publish_rate);
@@ -106,8 +117,8 @@ SemanticMapNode::SemanticMapNode()
       std::bind(&SemanticMapNode::publishTimer, this));
 
   RCLCPP_INFO(this->get_logger(),
-      "SemanticMapNode ready. voxel=%.3f, grid_cell=%.3f, max_clouds=%d",
-      voxel_size_, grid_cell_size_, max_clouds_);
+      "SemanticMapNode ready. voxel=%.3f, grid_cell=%.3f, max_clouds=%d, mode=%s",
+      voxel_size_, grid_cell_size_, max_clouds_, grid_mode_.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -266,18 +277,79 @@ void SemanticMapNode::publishTimer() {
       }
     }
 
-    nav_msgs::msg::OccupancyGrid grid_msg;
-    grid_msg.header.stamp = this->now();
-    grid_msg.header.frame_id = target_frame_;
-    grid_msg.info.resolution = grid_cell_size_;
-    grid_msg.info.width = width;
-    grid_msg.info.height = height;
-    grid_msg.info.origin.position.x = xMin;
-    grid_msg.info.origin.position.y = yMin;
-    grid_msg.info.origin.position.z = 0.0;
-    grid_msg.info.origin.orientation.w = 1.0;
-    grid_msg.data.assign(grid.begin(), grid.end());
-    grid_pub_->publish(grid_msg);
+    // ---- 栅格输出 ----
+    if (grid_mode_ == "image") {
+      // 彩色语义栅格图: 每个栅格单元用该位置最高置信度点的原始 RGB 着色
+      // 未知区域 = 灰色 (128,128,128)
+      // 空闲区域 = 白色 (255,255,255)
+      cv::Mat grid_img(height, width, CV_8UC3, cv::Scalar(128, 128, 128));
+
+      // 存储每个栅格的最佳色彩 (代价最高的点的 RGB)
+      struct CellInfo {
+        int8_t cost = -1;    // -1 = unknown
+        uint8_t r = 128, g = 128, b = 128;
+      };
+      std::vector<CellInfo> cells(width * height);
+
+      for (const auto &pt : merged->points) {
+        int gx = static_cast<int>((pt.x - xMin) / grid_cell_size_);
+        int gy = static_cast<int>((pt.y - yMin) / grid_cell_size_);
+        if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
+
+        int idx = gy * width + gx;
+
+        if (pt.z >= grid_min_height_ && pt.z <= grid_max_height_) {
+          uint32_t rgb_key = (static_cast<uint32_t>(pt.r) << 16) |
+                             (static_cast<uint32_t>(pt.g) << 8) |
+                              static_cast<uint32_t>(pt.b);
+          auto it = kColorToClass.find(rgb_key);
+          int8_t cost = (it != kColorToClass.end())
+                            ? getSemanticCost(it->second)
+                            : static_cast<int8_t>(100);
+
+          if (cost > cells[idx].cost) {
+            cells[idx].cost = cost;
+            cells[idx].r = pt.r;
+            cells[idx].g = pt.g;
+            cells[idx].b = pt.b;
+          }
+        } else if (cells[idx].cost < 0) {
+          cells[idx].cost = 0;
+          cells[idx].r = 255; cells[idx].g = 255; cells[idx].b = 255;
+        }
+      }
+
+      // 填充彩色图像
+      for (int gy = 0; gy < height; ++gy) {
+        cv::Vec3b *row = grid_img.ptr<cv::Vec3b>(gy);
+        for (int gx = 0; gx < width; ++gx) {
+          const auto &c = cells[gy * width + gx];
+          if (c.cost < 0) continue;  // unknown 保持灰色
+          row[gx] = cv::Vec3b(c.b, c.g, c.r);  // BGR
+        }
+      }
+
+      auto img_msg = cv_bridge::CvImage(
+          std_msgs::msg::Header(), "bgr8", grid_img).toImageMsg();
+      img_msg->header.stamp = this->now();
+      img_msg->header.frame_id = target_frame_;
+      grid_img_pub_->publish(*img_msg);
+
+    } else {
+      // OccupancyGrid 模式 (导航用)
+      nav_msgs::msg::OccupancyGrid grid_msg;
+      grid_msg.header.stamp = this->now();
+      grid_msg.header.frame_id = target_frame_;
+      grid_msg.info.resolution = grid_cell_size_;
+      grid_msg.info.width = width;
+      grid_msg.info.height = height;
+      grid_msg.info.origin.position.x = xMin;
+      grid_msg.info.origin.position.y = yMin;
+      grid_msg.info.origin.position.z = 0.0;
+      grid_msg.info.origin.orientation.w = 1.0;
+      grid_msg.data.assign(grid.begin(), grid.end());
+      grid_pub_->publish(grid_msg);
+    }
   }
 
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
