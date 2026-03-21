@@ -142,10 +142,9 @@ ament_target_dependencies(rtabmap_slam_node
 
 # === semantic_map_node (语义地图累积 — 用 TF 变换 + 体素滤波) ===
 add_executable(semantic_map_node src/pointcloud/semantic_map_node.cpp)
-target_link_libraries(semantic_map_node ${PCL_LIBRARIES} ${OpenCV_LIBS})
+target_link_libraries(semantic_map_node ${PCL_LIBRARIES})
 ament_target_dependencies(semantic_map_node
   rclcpp sensor_msgs nav_msgs pcl_conversions tf2_ros tf2_geometry_msgs tf2_eigen
-  cv_bridge
 )
 
 # === test_yolo_unit (YOLO 单元测试) ===

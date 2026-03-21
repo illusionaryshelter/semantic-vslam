@@ -29,6 +29,3 @@ semantic_map_node:
     grid_cell_size: 0.05      # 栅格分辨率 (m)
     grid_min_height: 0.1      # 障碍物最低高度 (m), 低于此视为地面
     grid_max_height: 2.0      # 障碍物最高高度 (m)
-
-    # 栅格输出模式: "occupancy" = OccupancyGrid, "image" = 彩色语义图
-    grid_mode: "image"
