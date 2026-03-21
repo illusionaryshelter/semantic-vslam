@@ -9,12 +9,58 @@
  */
 
 #include "semantic_vslam/semantic_map_node.hpp"
+#include "semantic_vslam/semantic_colors.hpp"
 
 #include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <set>
+#include <unordered_map>
 
 namespace semantic_vslam {
+
+// 动态类别 (导航时忽略, 代价=0)
+static const std::set<int> kDynamicClasses = {
+    0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19
+};
+
+// RGB → class_id 反向查表 (从 kSemanticColors 构建)
+static std::unordered_map<uint32_t, int> buildColorToClassMap() {
+  std::unordered_map<uint32_t, int> m;
+  for (int i = 0; i < 80; ++i) {
+    uint32_t key = (static_cast<uint32_t>(kSemanticColors[i][0]) << 16) |
+                   (static_cast<uint32_t>(kSemanticColors[i][1]) << 8) |
+                    static_cast<uint32_t>(kSemanticColors[i][2]);
+    m[key] = i;
+  }
+  return m;
+}
+static const auto kColorToClass = buildColorToClassMap();
+
+// 根据 class_id 返回导航代价 (0=空闲, 1-99=代价, 100=不可通行)
+static int8_t getSemanticCost(int class_id) {
+  if (kDynamicClasses.count(class_id)) return 0;   // 动态物体: 忽略
+  switch (class_id) {
+    // 大型家具: 不可通行
+    case 57: // couch
+    case 59: // bed
+    case 72: // refrigerator
+    case 62: // tv
+      return 100;
+    // 中型障碍: 高代价
+    case 56: // chair     — 可能移开
+    case 60: // dining table
+    case 61: // toilet
+      return 80;
+    // 小型物品: 中等代价
+    case 58: // potted plant
+    case 75: // vase
+    case 73: // book
+      return 50;
+    // 其他静态物体: 障碍
+    default: return 100;
+  }
+}
 
 SemanticMapNode::SemanticMapNode()
     : Node("semantic_map_node") {
@@ -187,17 +233,36 @@ void SemanticMapNode::publishTimer() {
     // 初始化: -1 = unknown
     std::vector<int8_t> grid(width * height, -1);
 
-    // 投影: 按高度分类
+    // 投影: 语义代价感知
+    // 策略: 取每个栅格中最大代价 (max-cost-wins)
     for (const auto &pt : merged->points) {
       int gx = static_cast<int>((pt.x - xMin) / grid_cell_size_);
       int gy = static_cast<int>((pt.y - yMin) / grid_cell_size_);
       if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
 
       int idx = gy * width + gx;
+
       if (pt.z >= grid_min_height_ && pt.z <= grid_max_height_) {
-        grid[idx] = 100;  // 障碍
-      } else if (grid[idx] != 100) {
-        grid[idx] = 0;    // 自由 (不覆盖已标记的障碍)
+        // 查找语义类别
+        uint32_t rgb_key = (static_cast<uint32_t>(pt.r) << 16) |
+                           (static_cast<uint32_t>(pt.g) << 8) |
+                            static_cast<uint32_t>(pt.b);
+        auto it = kColorToClass.find(rgb_key);
+        int8_t cost;
+        if (it != kColorToClass.end()) {
+          cost = getSemanticCost(it->second);
+        } else {
+          // 非语义点 (原始相机颜色): 视为普通障碍
+          cost = 100;
+        }
+
+        // max-cost-wins: 只升级不降级
+        if (cost > grid[idx]) {
+          grid[idx] = cost;
+        }
+      } else if (grid[idx] < 0) {
+        // 低于障碍高度 + 未被任何障碍标记 → 空闲
+        grid[idx] = 0;
       }
     }
 
