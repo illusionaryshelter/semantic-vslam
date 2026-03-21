@@ -2,22 +2,11 @@
 # Semantic VSLAM 参数配置
 # =============================================================================
 # 使用方法:
-#   ros2 launch semantic_vslam semantic_slam.launch.py
-#   所有参数从此文件加载, 无需在命令行指定
+#   ros2 launch semantic_vslam semantic_slam.launch.py \
+#       engine_path:=$HOME/Desktop/ANTI/models/yolov8n-seg.engine
+#
+# 此文件由 launch.py 自动加载, 无需手动指定
 # =============================================================================
-
-# ---- Launch 控制 (这些由 launch.py 读取, 非 ROS param) ----
-launch:
-  engine_path: "models/yolov8n-seg.engine"   # TensorRT engine 路径
-  launch_camera: true                         # 是否启动 Astra Pro 驱动
-  rviz: false                                 # 是否启动 RViz2
-  database_path: "/tmp/semantic_slam.db"      # RTAB-Map 数据库路径
-
-# ---- Topic 名称 ----
-topics:
-  rgb: "/camera/color/image_raw"
-  depth: "/camera/depth/image_raw"
-  camera_info: "/camera/color/camera_info"
 
 # ---- 语义点云节点 (semantic_cloud_node) ----
 semantic_cloud_node:
