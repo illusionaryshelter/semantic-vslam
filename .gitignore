@@ -44,3 +44,4 @@ Thumbs.db
 # Gemini agent
 .gemini/
 .agents/
+AGENTS.md

@@ -12,9 +12,17 @@
 #include "semantic_vslam/cuda_colorspace.hpp"
 
 #include <chrono>
+#include <set>
 #include <pcl_conversions/pcl_conversions.h>
 
 namespace semantic_vslam {
+
+// COCO 动态类别 ID (可能在场景中移动的物体)
+// person=0, bicycle=1, car=2, motorcycle=3, bus=5, train=6, truck=7,
+// bird=14, cat=15, dog=16, horse=17, sheep=18, cow=19
+static const std::set<int> kDynamicClasses = {
+    0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19
+};
 
 SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
     : Node("semantic_cloud_node", options) {
@@ -180,9 +188,65 @@ void SemanticCloudNode::syncCallback(
   pc2_msg.header = rgb_msg->header;
   cloud_pub_->publish(pc2_msg);
 
-  // 5. 转发原始 RGB / Depth 供 RTAB-Map 使用
+  // 5. 动态物体深度掩码: 将人/车/动物等动态类别区域的深度置零
+  //    rtabmap 在深度=0 的区域不提特征 → 消除动态物体鬼影
+  //    安全机制: 如果剔除比例 >50%, 跳过掩码防止特征过少跟丢
+  cv::Mat filtered_depth = depth;  // 默认: 不拷贝, 直接用原始深度
+  int masked_pixels = 0;
+  int valid_pixels = 0;
+
+  if (!label_map.empty()) {
+    // 先统计: 动态区域占多少有效深度像素?
+    const bool is_16u = (depth.type() == CV_16UC1);
+    for (int v = 0; v < depth.rows; ++v) {
+      const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+      const uint16_t *d16_row = is_16u ? depth.ptr<uint16_t>(v) : nullptr;
+      const float *df_row = !is_16u ? depth.ptr<float>(v) : nullptr;
+      for (int u = 0; u < depth.cols; ++u) {
+        float z = is_16u ? static_cast<float>(d16_row[u]) * depth_scale_ : df_row[u];
+        if (z > 0.01f && z < 10.0f) {
+          valid_pixels++;
+          uint8_t lbl = lbl_row[u];
+          if (lbl > 0 && kDynamicClasses.count(lbl - 1)) {
+            masked_pixels++;
+          }
+        }
+      }
+    }
+
+    // 安全阈值: 动态区域占有效深度 <50% 才执行掩码
+    if (masked_pixels > 0 && valid_pixels > 0 &&
+        masked_pixels < valid_pixels / 2) {
+      filtered_depth = depth.clone();
+      for (int v = 0; v < filtered_depth.rows; ++v) {
+        const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
+        if (is_16u) {
+          uint16_t *d_row = filtered_depth.ptr<uint16_t>(v);
+          for (int u = 0; u < filtered_depth.cols; ++u) {
+            if (lbl_row[u] > 0 && kDynamicClasses.count(lbl_row[u] - 1))
+              d_row[u] = 0;
+          }
+        } else {
+          float *d_row = filtered_depth.ptr<float>(v);
+          for (int u = 0; u < filtered_depth.cols; ++u) {
+            if (lbl_row[u] > 0 && kDynamicClasses.count(lbl_row[u] - 1))
+              d_row[u] = 0.0f;
+          }
+        }
+      }
+    }
+  }
+
+  // 转发 RGB + 过滤后深度给 rtabmap
   rgb_pub_->publish(*rgb_msg);
-  depth_pub_->publish(*depth_msg);
+  if (filtered_depth.data != depth.data) {
+    // 深度被过滤过 → 重新封装为 ROS 消息
+    auto filt_msg = cv_bridge::CvImage(
+        depth_msg->header, cv_depth->encoding, filtered_depth).toImageMsg();
+    depth_pub_->publish(*filt_msg);
+  } else {
+    depth_pub_->publish(*depth_msg);
+  }
 
   // 6. 发布语义标签图
   auto label_msg = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
@@ -197,9 +261,10 @@ void SemanticCloudNode::syncCallback(
   auto ms_pub  = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
   auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t0).count();
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-      "Frame: cvt=%ldms yolo=%ldms cloud=%ldms pub=%ldms TOTAL=%ldms (%.1f FPS) objs=%zu",
+      "Frame: cvt=%ldms yolo=%ldms cloud=%ldms pub=%ldms TOTAL=%ldms (%.1f FPS) objs=%zu mask=%d/%d",
       ms_cvt, ms_yolo, ms_cloud, ms_pub, ms_total,
-      ms_total > 0 ? 1000.0 / ms_total : 0.0, objects.size());
+      ms_total > 0 ? 1000.0 / ms_total : 0.0, objects.size(),
+      masked_pixels, valid_pixels);
 }
 
 // ---------------------------------------------------------------------------
