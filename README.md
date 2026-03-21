@@ -1,4 +1,4 @@
-# 🧠 Semantic VSLAM
+#  Semantic VSLAM
 
 > **基于 YOLOv8-seg + RTAB-Map 的实时语义视觉 SLAM 系统**
 >
@@ -8,7 +8,7 @@
 
 ---
 
-## 📐 系统架构
+##  系统架构
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
@@ -39,7 +39,7 @@
 
 ---
 
-## ⚡ 性能优化与实测
+##  性能优化与实测
 
 在 **Jetson Orin Nano 8GB** + **Astra Pro 640×480@30fps** 上实测:
 
@@ -75,7 +75,7 @@
 
 ---
 
-## 🛠 依赖
+## 依赖
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
@@ -89,7 +89,7 @@
 
 ---
 
-## 🔨 构建
+##  构建
 
 ```bash
 # 1. 安装 ROS 2 依赖
@@ -119,7 +119,7 @@ source install/setup.bash
 
 ---
 
-## 🚀 运行
+##  运行
 
 ### 完整语义 SLAM 系统
 
@@ -150,7 +150,7 @@ ros2 launch semantic_vslam test_rtabmap_standalone.launch.py
 
 ---
 
-## ⚙️ 参数配置
+##  参数配置
 
 ### Launch 参数
 
@@ -190,7 +190,7 @@ ros2 launch semantic_vslam semantic_slam.launch.py \
 
 ---
 
-## 📁 项目结构
+##  项目结构
 
 ```
 ANTI/
@@ -228,7 +228,7 @@ ANTI/
 
 ---
 
-## 📷 支持的相机
+##  支持的相机
 
 | 相机 | 编码 | 适配方式 |
 |---|---|---|
