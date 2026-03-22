@@ -41,7 +41,3 @@ models/*.pt
 .DS_Store
 Thumbs.db
 
-# Gemini agent
-.gemini/
-.agents/
-AGENTS.md
