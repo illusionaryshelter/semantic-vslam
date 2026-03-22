@@ -162,15 +162,10 @@ def generate_launch_description():
                         '--Rtabmap/DetectionRate 2 '
                         '--RGBD/OptimizeMaxError 3.0 '
                         '--Mem/RehearsalSimilarity 0.6 '
-                        # Grid Map 参数
-                        '--Grid/CellSize 0.05 '
-                        '--Grid/RangeMax 5.0 '
-                        '--Grid/MaxObstacleHeight 2.0 '
-                        '--Grid/MinClusterSize 20 '
-                        '--Grid/NormalK 20 '
-                        # 3D Map (cloud_map) 参数
-                        '--Grid/3D true '
-                        '--GridGlobal/MinSize 20.0 ',
+                        # 禁用 rtabmap 自带地图 (我们有语义版本)
+                        '--Grid/FromDepth false '   # 不从深度图生成栅格 → 节省大量 CPU
+                        '--Grid/3D false '           # 不生成 3D cloud_map
+                        '--Grid/RangeMax 0 ',        # 禁用栅格射线追踪
             }.items(),
         ),
 
