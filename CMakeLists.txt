@@ -61,6 +61,7 @@ add_library(yolo_inference SHARED
   src/model_inference/yolo_inference.cpp
   src/model_inference/cuda_preprocess.cu
   src/model_inference/cuda_colorspace.cu
+  src/model_inference/cuda_depth_projection.cu
 )
 set_target_properties(yolo_inference PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(yolo_inference

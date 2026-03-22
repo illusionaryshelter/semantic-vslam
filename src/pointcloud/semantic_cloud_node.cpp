@@ -10,6 +10,7 @@
 
 #include "semantic_vslam/semantic_cloud_node.hpp"
 #include "semantic_vslam/cuda_colorspace.hpp"
+#include "semantic_vslam/cuda_depth_projection.hpp"
 
 #include <chrono>
 #include <set>
@@ -61,6 +62,20 @@ SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
     throw std::runtime_error("YOLO init failed");
   }
   RCLCPP_INFO(this->get_logger(), "YOLO model loaded: %s", engine_path.c_str());
+
+  // ---- 初始化 CUDA 深度投影常量表 ----
+  {
+    uint8_t colors[80][3];
+    bool dynamic[80] = {};
+    for (int i = 0; i < 80; ++i) {
+      colors[i][0] = kSemanticColors[i][0];
+      colors[i][1] = kSemanticColors[i][1];
+      colors[i][2] = kSemanticColors[i][2];
+      dynamic[i] = kDynamicClasses.count(i) > 0;
+    }
+    cuda::gpuDepthProjectionInit(colors, dynamic);
+    RCLCPP_INFO(this->get_logger(), "CUDA depth projection initialized");
+  }
 
   // ---- 订阅相机内参 (只需获取一次) ----
   cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -177,10 +192,47 @@ void SemanticCloudNode::syncCallback(
 
   auto t2 = std::chrono::steady_clock::now();
 
-  // 3. 生成语义点云 + 标签图 (优化: 发布 PointXYZRGB, 节省带宽)
+  // 3. 生成语义标签图 (CPU — 依赖 YOLO mask, 数据量小)
+  cv::Mat label_map = cv::Mat::zeros(depth.rows, depth.cols, CV_8UC1);
+  cv::Mat conf_map = cv::Mat::zeros(depth.rows, depth.cols, CV_32FC1);
+  for (const auto &obj : objects) {
+    const cv::Rect &r = obj.rect;
+    int x0 = std::max(0, r.x);
+    int y0 = std::max(0, r.y);
+    int x1 = std::min(depth.cols, r.x + r.width);
+    int y1 = std::min(depth.rows, r.y + r.height);
+    if (x0 >= x1 || y0 >= y1 || obj.mask.empty()) continue;
+    for (int y = y0; y < y1; ++y) {
+      const uint8_t *mask_row = obj.mask.ptr<uint8_t>(y - r.y);
+      uint8_t *label_row = label_map.ptr<uint8_t>(y);
+      float *conf_row = conf_map.ptr<float>(y);
+      for (int x = x0; x < x1; ++x) {
+        int mx = x - r.x;
+        if (mx >= 0 && mx < obj.mask.cols && mask_row[mx] > 0) {
+          if (obj.prob > conf_row[x]) {
+            label_row[x] = static_cast<uint8_t>(obj.label + 1);
+            conf_row[x] = obj.prob;
+          }
+        }
+      }
+    }
+  }
+
+  // 4. GPU 深度投影 + 动态过滤 + 语义着色 (融合 kernel)
+  //    内核输出 PCL 兼容 32-byte 布局 → 单次 memcpy 填充点云
+  const int pixels = depth.rows * depth.cols;
   pcl::PointCloud<pcl::PointXYZRGB> cloud;
-  cv::Mat label_map;
-  generateSemanticCloud(bgr_for_cloud, depth, objects, cloud, label_map);
+  cloud.width = depth.cols;
+  cloud.height = depth.rows;
+  cloud.is_dense = false;
+  cloud.points.resize(pixels);
+
+  cuda::gpuDepthProjectionRaw(
+      depth.data, (depth.type() == CV_16UC1),
+      label_map.data, bgr_for_cloud.data,
+      depth.cols, depth.rows,
+      fx_, fy_, cx_, cy_, depth_scale_,
+      cloud.points.data());  // 直接写入 PCL 内存
 
   auto t3 = std::chrono::steady_clock::now();
 
