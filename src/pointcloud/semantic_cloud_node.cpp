@@ -350,6 +350,12 @@ void SemanticCloudNode::generateSemanticCloud(
       uint8_t lbl = lbl_row[u];
       if (lbl > 0) {
         int cls = lbl - 1;
+        // 动态物体 → NaN (不进入语义地图, 避免鬼影)
+        if (kDynamicClasses.count(cls)) {
+          pt.x = pt.y = pt.z = std::numeric_limits<float>::quiet_NaN();
+          pt.r = pt.g = pt.b = 0;
+          continue;
+        }
         if (cls >= 0 && cls < 80) {
           pt.r = kSemanticColors[cls][0];
           pt.g = kSemanticColors[cls][1];
