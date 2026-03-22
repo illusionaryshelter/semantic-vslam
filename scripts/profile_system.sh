@@ -1,17 +1,10 @@
 #!/bin/bash
 # =============================================================
-# profile_system.sh
-#
-# 语义 SLAM 系统性能 Profiling 脚本
+# profile_system.sh — 语义 SLAM 系统性能 Profiling
 #
 # 用法:
-#   1. 先启动系统: ros2 launch semantic_vslam semantic_slam.launch.py ...
-#   2. 另开终端:  bash scripts/profile_system.sh [duration_seconds]
-#
-# 输出:
-#   - Topic 发布频率
-#   - 节点 CPU / 内存占用
-#   - 汇总报告
+#   1. 启动系统: ros2 launch semantic_vslam semantic_slam.launch.py ...
+#   2. 另开终端: bash scripts/profile_system.sh [duration_seconds]
 # =============================================================
 
 DURATION=${1:-15}
@@ -23,47 +16,42 @@ echo "=========================================="
 source /opt/ros/humble/setup.bash
 source install/setup.bash 2>/dev/null
 
-echo ""
-echo "--- [1/4] Topic Rates (测量 ${DURATION}s) ---"
-echo ""
+TMPDIR=$(mktemp -d)
 
-# 并行测量关键 topic 频率
-declare -A TOPICS=(
-  ["rgb_raw"]="/camera/color/image_raw"
-  ["depth_raw"]="/camera/depth/image_raw"
-  ["semantic_cloud"]="/semantic_vslam/semantic_cloud"
-  ["label_map"]="/semantic_vslam/label_map"
-  ["map_cloud"]="/semantic_vslam/semantic_map_cloud"
-  ["grid_map"]="/semantic_vslam/grid_map"
-  ["grid_visual"]="/semantic_vslam/grid_map_visual"
-  ["object_markers"]="/semantic_vslam/object_markers"
-  ["rtabmap_odom"]="/odom"
+# ---- 1. Topic Rates ----
+echo ""
+echo "--- [1/3] Topic Rates (测量 ${DURATION}s) ---"
+
+TOPICS=(
+  "/camera/color/image_raw"
+  "/camera/depth/image_raw"
+  "/semantic_vslam/semantic_cloud"
+  "/semantic_vslam/label_map"
+  "/semantic_vslam/semantic_map_cloud"
+  "/semantic_vslam/grid_map"
+  "/semantic_vslam/grid_map_visual"
+  "/semantic_vslam/object_markers"
+  "/odom"
 )
 
-TMPDIR=$(mktemp -d)
-for key in "${!TOPICS[@]}"; do
-  topic="${TOPICS[$key]}"
-  (timeout ${DURATION} ros2 topic hz "$topic" --window 50 2>/dev/null | tail -1 > "$TMPDIR/$key.txt") &
+for topic in "${TOPICS[@]}"; do
+  fname=$(echo "$topic" | tr '/' '_')
+  (timeout ${DURATION} ros2 topic hz "$topic" --window 30 2>&1 > "$TMPDIR/${fname}.txt") &
 done
 
-# 同时采集 CPU/内存
-echo "--- [2/4] CPU/Memory (采样中...) ---"
-echo ""
-
-# 找到相关进程
+# ---- 2. CPU/Memory 采样 ----
+echo "--- [2/3] CPU/Memory (采样中...) ---"
 sleep 2
-PIDS=$(ps aux | grep -E 'semantic_cloud|semantic_map|object_map|rtabmap|rgbd_odometry' | grep -v grep | awk '{print $2}' | tr '\n' ',' | sed 's/,$//')
 
-if [ -n "$PIDS" ]; then
-  # 采样 CPU/内存
-  for i in $(seq 1 3); do
-    ps -p $(echo $PIDS | tr ',' ' ') -o pid,%cpu,%mem,rss,comm --no-headers 2>/dev/null >> "$TMPDIR/ps_samples.txt"
-    sleep $(( DURATION / 3 ))
-  done
-fi
+for i in $(seq 1 3); do
+  ps aux | grep -E 'semantic_cloud|semantic_map|object_map|rtabmap|rgbd_odometry' | grep -v grep | \
+    awk '{printf "%-30s %6s %6s %8s\n", $11, $3, $4, $6}' >> "$TMPDIR/ps_samples.txt"
+  sleep $(( (DURATION - 2) / 3 ))
+done
 
-wait  # 等待 hz 测量完成
+wait  # 等待 hz 完成
 
+# ---- 输出结果 ----
 echo ""
 echo "=========================================="
 echo "  RESULTS"
@@ -71,43 +59,36 @@ echo "=========================================="
 
 echo ""
 echo "--- Topic Publish Rates ---"
-printf "%-22s %s\n" "TOPIC" "RATE"
-echo "--------------------------------------"
-for key in "${!TOPICS[@]}"; do
-  rate="N/A"
-  if [ -f "$TMPDIR/$key.txt" ] && [ -s "$TMPDIR/$key.txt" ]; then
-    rate=$(cat "$TMPDIR/$key.txt" | grep -oP 'average rate: \K[0-9.]+' || echo "N/A")
-    if [ "$rate" != "N/A" ]; then
-      rate="${rate} Hz"
+printf "%-40s %s\n" "TOPIC" "RATE"
+echo "------------------------------------------------------------"
+for topic in "${TOPICS[@]}"; do
+  fname=$(echo "$topic" | tr '/' '_')
+  file="$TMPDIR/${fname}.txt"
+  rate="(no data)"
+  if [ -f "$file" ] && [ -s "$file" ]; then
+    # ros2 topic hz 输出: "average rate: 29.998"
+    extracted=$(grep -m1 'average rate' "$file" | sed 's/.*average rate: //' | awk '{printf "%.1f Hz", $1}')
+    if [ -n "$extracted" ]; then
+      rate="$extracted"
     fi
   fi
-  printf "%-22s %s\n" "$key" "$rate"
+  printf "%-40s %s\n" "$topic" "$rate"
 done
 
 echo ""
-echo "--- Node CPU / Memory ---"
-printf "%-25s %8s %8s %10s\n" "PROCESS" "CPU%" "MEM%" "RSS(MB)"
-echo "------------------------------------------------------"
+echo "--- Node CPU / Memory (average of 3 samples) ---"
+printf "%-35s %8s %8s %10s\n" "PROCESS" "CPU%" "MEM%" "RSS(MB)"
+echo "------------------------------------------------------------"
 if [ -f "$TMPDIR/ps_samples.txt" ]; then
-  # 按进程名取平均
   awk '{
-    cpu[$5]+=$2; mem[$5]+=$3; rss[$5]+=$4; count[$5]++
+    cpu[$1]+=$2; mem[$1]+=$3; rss[$1]+=$4; count[$1]++
   } END {
     for (name in cpu) {
-      printf "%-25s %7.1f%% %7.1f%% %9.1f\n", name, cpu[name]/count[name], mem[name]/count[name], rss[name]/count[name]/1024
+      printf "%-35s %7.1f%% %7.1f%% %9.1f\n", name, cpu[name]/count[name], mem[name]/count[name], rss[name]/count[name]/1024
     }
   }' "$TMPDIR/ps_samples.txt" | sort -t% -k2 -rn
 fi
 
-echo ""
-echo "--- Node Timing (check terminal logs) ---"
-echo "semantic_cloud_node: [perf] cvt=?ms yolo=?ms cloud=?ms ..."
-echo "semantic_map_node:   [perf] map: merge=?ms voxel=?ms ..."
-echo "object_map_node:     [perf] obj: extract=?ms publish=?ms ..."
-echo ""
-echo "Tip: 在系统运行终端查看 [perf] 行获取每个节点的详细耗时"
-
-# 总内存
 echo ""
 echo "--- System Memory ---"
 free -h | head -2
@@ -119,11 +100,15 @@ if command -v tegrastats &>/dev/null; then
 elif command -v nvidia-smi &>/dev/null; then
   nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null
 else
-  echo "No GPU monitor available"
+  echo "No GPU monitor available (install tegrastats or nvidia-smi)"
 fi
 
-rm -rf "$TMPDIR"
+echo ""
+echo "--- [perf] Logs ---"
+echo "要查看节点内部详细耗时, 请在 params.yaml 中设置 enable_profiling: true"
+echo "重启系统后在启动终端查看 [perf] 行"
 
+rm -rf "$TMPDIR"
 echo ""
 echo "=========================================="
 echo "  Profiling complete"

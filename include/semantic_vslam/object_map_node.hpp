@@ -83,6 +83,7 @@ private:
   int min_points_;               // 物体最少 3D 点数
   float merge_distance_;         // 同类物体合并距离 (m)
   int max_objects_;              // 最大物体数量
+  bool enable_profiling_ = false;
 };
 
 } // namespace semantic_vslam

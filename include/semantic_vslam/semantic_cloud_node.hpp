@@ -86,6 +86,7 @@ private:
   // 推理参数
   float conf_thresh_ = 0.4f;
   float iou_thresh_ = 0.45f;
+  bool enable_profiling_ = false;
 };
 
 } // namespace semantic_vslam

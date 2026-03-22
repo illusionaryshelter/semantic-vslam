@@ -28,6 +28,7 @@ SemanticMapNode::SemanticMapNode()
   this->declare_parameter<double>("grid_cell_size", 0.05);
   this->declare_parameter<double>("grid_min_height", 0.1);
   this->declare_parameter<double>("grid_max_height", 2.0);
+  this->declare_parameter<bool>("enable_profiling", false);
 
   target_frame_ = this->get_parameter("target_frame").as_string();
   voxel_size_ = this->get_parameter("voxel_size").as_double();
@@ -37,6 +38,7 @@ SemanticMapNode::SemanticMapNode()
   grid_cell_size_ = this->get_parameter("grid_cell_size").as_double();
   grid_min_height_ = this->get_parameter("grid_min_height").as_double();
   grid_max_height_ = this->get_parameter("grid_max_height").as_double();
+  enable_profiling_ = this->get_parameter("enable_profiling").as_bool();
 
   // ---- TF2 ----
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -68,7 +70,8 @@ SemanticMapNode::SemanticMapNode()
 void SemanticMapNode::cloudCallback(
     const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
 
-  auto t0 = std::chrono::steady_clock::now();
+  auto t0 = enable_profiling_ ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
 
   // 查找 TF: semantic_cloud frame → map
   geometry_msgs::msg::TransformStamped tf_stamped;
@@ -222,15 +225,16 @@ void SemanticMapNode::publishTimer() {
     grid_pub_->publish(grid_msg);
   }
 
-  auto tp3 = std::chrono::steady_clock::now();
-  auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
-  auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
-  auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
-  auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
-
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-      "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
-      ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
+  if (enable_profiling_) {
+    auto tp3 = std::chrono::steady_clock::now();
+    auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+    auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
+    auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
+    auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
+        ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
+  }
 }
 
 } // namespace semantic_vslam

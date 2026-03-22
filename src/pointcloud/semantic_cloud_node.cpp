@@ -38,6 +38,8 @@ SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
   this->declare_parameter<float>("conf_thresh", 0.4f);
   this->declare_parameter<float>("iou_thresh", 0.45f);
   this->declare_parameter<float>("depth_scale", 0.001f); // Astra Pro: mm → m
+  this->declare_parameter<bool>("enable_profiling", false);
+  enable_profiling_ = this->get_parameter("enable_profiling").as_bool();
 
   std::string engine_path = this->get_parameter("engine_path").as_string();
   std::string rgb_topic = this->get_parameter("rgb_topic").as_string();
@@ -252,19 +254,19 @@ void SemanticCloudNode::syncCallback(
   auto label_msg = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
   label_map_pub_->publish(*label_msg);
 
-  auto t4 = std::chrono::steady_clock::now();
-
-  // 性能统计 (每 3 秒输出一次)
-  auto ms_cvt  = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-  auto ms_yolo = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-  auto ms_cloud = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-  auto ms_pub  = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
-  auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t0).count();
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-      "Frame: cvt=%ldms yolo=%ldms cloud=%ldms pub=%ldms TOTAL=%ldms (%.1f FPS) objs=%zu mask=%d/%d",
-      ms_cvt, ms_yolo, ms_cloud, ms_pub, ms_total,
-      ms_total > 0 ? 1000.0 / ms_total : 0.0, objects.size(),
-      masked_pixels, valid_pixels);
+  if (enable_profiling_) {
+    auto t4 = std::chrono::steady_clock::now();
+    auto ms_cvt  = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    auto ms_yolo = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    auto ms_cloud = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    auto ms_pub  = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
+    auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t0).count();
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+        "[perf] cvt=%ldms yolo=%ldms cloud=%ldms pub=%ldms total=%ldms (%.1f FPS) objs=%zu mask=%d/%d",
+        ms_cvt, ms_yolo, ms_cloud, ms_pub, ms_total,
+        ms_total > 0 ? 1000.0 / ms_total : 0.0, objects.size(),
+        masked_pixels, valid_pixels);
+  }
 }
 
 // ---------------------------------------------------------------------------

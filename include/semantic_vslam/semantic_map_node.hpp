@@ -62,7 +62,8 @@ private:
   int cloud_decimation_;       // 输入点云抽稀 (性能优化)
   double grid_cell_size_;      // 2D 栅格分辨率 (m)
   double grid_min_height_;     // 障碍物最低高度 (m)
-  double grid_max_height_;     // 障碍物最高高度 (m)
+  double grid_max_height_;              // 障碍物最高高度 (m)
+  bool enable_profiling_ = false;
 };
 
 } // namespace semantic_vslam
