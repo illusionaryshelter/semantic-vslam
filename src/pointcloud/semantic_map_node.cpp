@@ -116,68 +116,9 @@ void SemanticMapNode::cloudCallback(
 
   if (transformed->empty()) return;
 
-  // ---- 单帧质心预滤波 (减少存入窗口的点数) ----
-  // 每帧 ~77k 点 → ~5k 点 (~1ms), 150 帧全量从 10M → ~750k
-  // 使用与 publishTimer 相同的体素尺寸和质心平均, 不损失质量
-  if (voxel_size_ > 0.0) {
-    struct FrameVoxelAccum {
-      double sx, sy, sz, sr, sg, sb;
-      int count;
-    };
-    struct FVKey {
-      int x, y, z;
-      bool operator==(const FVKey &o) const {
-        return x == o.x && y == o.y && z == o.z;
-      }
-    };
-    struct FVKeyHash {
-      size_t operator()(const FVKey &k) const {
-        size_t h = 2166136261u;
-        h ^= std::hash<int>()(k.x); h *= 16777619u;
-        h ^= std::hash<int>()(k.y); h *= 16777619u;
-        h ^= std::hash<int>()(k.z); h *= 16777619u;
-        return h;
-      }
-    };
-    const float inv_vs = static_cast<float>(1.0 / voxel_size_);
-
-    std::unordered_map<FVKey, FrameVoxelAccum, FVKeyHash> frame_voxels;
-    frame_voxels.reserve(transformed->size() / 3);
-
-    for (const auto &pt : transformed->points) {
-      FVKey key;
-      key.x = static_cast<int>(std::floor(pt.x * inv_vs));
-      key.y = static_cast<int>(std::floor(pt.y * inv_vs));
-      key.z = static_cast<int>(std::floor(pt.z * inv_vs));
-
-      auto &v = frame_voxels[key];
-      v.sx += pt.x;  v.sy += pt.y;  v.sz += pt.z;
-      v.sr += pt.r;  v.sg += pt.g;  v.sb += pt.b;
-      v.count++;
-    }
-
-    auto pre_filtered = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
-    pre_filtered->reserve(frame_voxels.size());
-    for (const auto &[key, v] : frame_voxels) {
-      float inv_n = 1.0f / v.count;
-      pcl::PointXYZRGB pt;
-      pt.x = static_cast<float>(v.sx * inv_n);
-      pt.y = static_cast<float>(v.sy * inv_n);
-      pt.z = static_cast<float>(v.sz * inv_n);
-      pt.r = static_cast<uint8_t>(std::clamp(v.sr * inv_n, 0.0, 255.0));
-      pt.g = static_cast<uint8_t>(std::clamp(v.sg * inv_n, 0.0, 255.0));
-      pt.b = static_cast<uint8_t>(std::clamp(v.sb * inv_n, 0.0, 255.0));
-      pre_filtered->push_back(pt);
-    }
-    pre_filtered->width = pre_filtered->size();
-    pre_filtered->height = 1;
-    pre_filtered->is_dense = true;
-    transformed = pre_filtered;
-  } else {
-    transformed->width = transformed->size();
-    transformed->height = 1;
-    transformed->is_dense = true;
-  }
+  transformed->width = transformed->size();
+  transformed->height = 1;
+  transformed->is_dense = true;
 
   // 添加到 sliding window
   {
@@ -192,92 +133,36 @@ void SemanticMapNode::cloudCallback(
 // ---------------------------------------------------------------------------
 void SemanticMapNode::publishTimer() {
   auto tp0 = std::chrono::steady_clock::now();
-  // ---- 哈希质心去重 (替代 pcl::VoxelGrid) ----
-  //
-  // pcl::VoxelGrid 内部: 排序 O(n log n) + 质心计算
-  // 哈希方案:        遍历 O(n) + 质心计算
-  //
-  // 关键: 必须用质心平均 (centroid), 不能用 last-write-wins,
-  //       否则 TF 漂移导致的重影无法被平滑
-  //
-  struct VoxelAccum {
-    double sx, sy, sz;  // 坐标累计 (double 避免大量相加时精度丢失)
-    double sr, sg, sb;  // 颜色累计
-    int count;
-  };
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
+      new pcl::PointCloud<pcl::PointXYZRGB>);
 
-  // 体素 key: 离散化 (x, y, z)
-  struct VKey {
-    int x, y, z;
-    bool operator==(const VKey &o) const {
-      return x == o.x && y == o.y && z == o.z;
-    }
-  };
-  struct VKeyHash {
-    size_t operator()(const VKey &k) const {
-      size_t h = 2166136261u;
-      h ^= std::hash<int>()(k.x); h *= 16777619u;
-      h ^= std::hash<int>()(k.y); h *= 16777619u;
-      h ^= std::hash<int>()(k.z); h *= 16777619u;
-      return h;
-    }
-  };
-
-  const float inv_vs = (voxel_size_ > 0.0) ?
-      static_cast<float>(1.0 / voxel_size_) : 0.0f;
-
-  std::unordered_map<VKey, VoxelAccum, VKeyHash> voxel_map;
-  size_t total_pts = 0;
-
-  // ---- 快照窗口指针 (最小化锁持有时间) ----
-  // 仅拷贝 shared_ptr (150个 × 16字节 ≈ 2.4KB), 不拷贝点云数据
-  std::vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> frame_ptrs;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (cloud_window_.empty()) return;
-    frame_ptrs.reserve(cloud_window_.size());
+
+    size_t total = 0;
+    for (const auto &sc : cloud_window_) total += sc.cloud->size();
+    merged->reserve(total);
+
     for (const auto &sc : cloud_window_) {
-      frame_ptrs.push_back(sc.cloud);
-      total_pts += sc.cloud->size();
+      *merged += *(sc.cloud);
     }
-  }
-  // 锁已释放 — cloudCallback 不再被阻塞
-
-  // 预估体素数量用于 reserve
-  voxel_map.reserve(total_pts / 3);
-
-  // 哈希质心累积 (无锁, 不阻塞 cloudCallback)
-  for (const auto &cloud_ptr : frame_ptrs) {
-    for (const auto &pt : cloud_ptr->points) {
-      VKey key;
-      key.x = static_cast<int>(std::floor(pt.x * inv_vs));
-      key.y = static_cast<int>(std::floor(pt.y * inv_vs));
-      key.z = static_cast<int>(std::floor(pt.z * inv_vs));
-
-      auto &v = voxel_map[key];
-      v.sx += pt.x;  v.sy += pt.y;  v.sz += pt.z;
-      v.sr += pt.r;  v.sg += pt.g;  v.sb += pt.b;
-      v.count++;
-    }
-  }
-
-  // ---- 输出质心点云 ----
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
-      new pcl::PointCloud<pcl::PointXYZRGB>);
-  merged->reserve(voxel_map.size());
-  for (const auto &[key, v] : voxel_map) {
-    float inv_n = 1.0f / v.count;
-    pcl::PointXYZRGB pt;
-    pt.x = static_cast<float>(v.sx * inv_n);
-    pt.y = static_cast<float>(v.sy * inv_n);
-    pt.z = static_cast<float>(v.sz * inv_n);
-    pt.r = static_cast<uint8_t>(std::clamp(v.sr * inv_n, 0.0, 255.0));
-    pt.g = static_cast<uint8_t>(std::clamp(v.sg * inv_n, 0.0, 255.0));
-    pt.b = static_cast<uint8_t>(std::clamp(v.sb * inv_n, 0.0, 255.0));
-    merged->push_back(pt);
   }
 
   if (merged->empty()) return;
+
+  auto tp1 = std::chrono::steady_clock::now();
+
+  // 体素滤波
+  if (voxel_size_ > 0.0) {
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
+    vg.setInputCloud(merged);
+    vg.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered(
+        new pcl::PointCloud<pcl::PointXYZRGB>);
+    vg.filter(*filtered);
+    merged = filtered;
+  }
 
   auto tp2 = std::chrono::steady_clock::now();
 
@@ -342,13 +227,13 @@ void SemanticMapNode::publishTimer() {
 
   if (enable_profiling_) {
     auto tp3 = std::chrono::steady_clock::now();
-    auto ms_dedup = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp0).count();
+    auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+    auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
     auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
     auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "[perf] map: dedup=%ldms pub=%ldms total=%ldms | %zu→%zu voxels, %zu frames",
-        ms_dedup, ms_pub, ms_total,
-        total_pts, merged->size(), cloud_window_.size());
+        "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
+        ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
   }
 }
 
