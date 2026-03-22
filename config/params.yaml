@@ -21,9 +21,9 @@ semantic_map_node:
   ros__parameters:
     # 地图参数
     target_frame: "map"       # 累积点云的目标坐标系
-    voxel_size: 0.02          # 体素滤波尺寸 (m), 越小越精细
-    max_clouds: 150           # 滑动窗口帧数, 越大地图越大但越慢
-    cloud_decimation: 3       # 输入点云抽稀倍率
+    voxel_size: 0.02          # 体素尺寸 (m), 越小越精细
+    cloud_decimation: 2       # 输入点云抽稀倍率 (2 = 每隔 1 个取 1 个)
+    voxel_ttl: 120.0          # 体素存活时间 (秒), 超时则清理
     enable_profiling: false
 
     # 2D 栅格参数
@@ -39,5 +39,5 @@ object_map_node:
     min_points: 50            # 物体最少 3D 点数 (过少则忽略)
     merge_distance: 0.5       # 同类物体合并距离 (m)
     max_objects: 50            # 最大跟踪物体数
-    publish_rate: 1.0          # MarkerArray 发布频率 (Hz)
+    publish_rate: 2.0          # MarkerArray 发布频率 (Hz)
     enable_profiling: false

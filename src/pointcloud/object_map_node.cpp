@@ -145,13 +145,15 @@ void ObjectMapNode::processTimer() {
 
 // ---------------------------------------------------------------------------
 void ObjectMapNode::extractObjects() {
-  // 取出最新数据 (不清空 — 允许下次 timer 重用同一帧)
+  // 取出最新数据 (取出后清空, 避免重复处理)
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
   sensor_msgs::msg::Image::SharedPtr label_msg;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     cloud_msg = latest_cloud_;
     label_msg = latest_label_;
+    latest_cloud_.reset();
+    latest_label_.reset();
   }
 
   if (!cloud_msg || !label_msg) return;
@@ -162,12 +164,12 @@ void ObjectMapNode::extractObjects() {
       rclcpp::Time(label_msg->header.stamp).seconds());
   if (dt > 0.1) return;
 
-  // 查找 TF: cloud frame → map
+  // 查找 TF: cloud frame → map (缩短等待时间以加快响应)
   Eigen::Matrix4f tf_mat;
   try {
     auto tf_stamped = tf_buffer_->lookupTransform(
         target_frame_, cloud_msg->header.frame_id,
-        tf2::TimePointZero, tf2::durationFromSec(0.1));
+        tf2::TimePointZero, tf2::durationFromSec(0.05));
     Eigen::Isometry3d tf_eigen = tf2::transformToEigen(tf_stamped.transform);
     tf_mat = tf_eigen.matrix().cast<float>();
   } catch (const tf2::TransformException &ex) {
@@ -403,7 +405,7 @@ void ObjectMapNode::publishMarkers() {
   int id = 0;
   for (const auto &obj : object_map_) {
     // 至少观测 2 次才显示 (过滤噪声)
-    if (obj.observe_count < 2) continue;
+    if (obj.observe_count < 1) continue;  // 首次检测即显示
 
     // 半透明立方体
     visualization_msgs::msg::Marker cube;
