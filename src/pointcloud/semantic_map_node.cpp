@@ -3,17 +3,14 @@
  *
  * 语义地图累积节点
  *
- * 架构:
- *   1. cloudCallback: 接收语义点云 → TF 变换到 map → 抽稀 → 存入滑动窗口
- *   2. publishTimer:  合并窗口内所有帧 → 哈希去重 → 发布 3D 地图 + 2D 栅格
- *
- * 性能关键优化:
- *   - 用哈希去重 (O(n)) 替代 pcl::VoxelGrid (O(n log n) + 高常数)
- *   - 实测: 150 帧 5 万点从 993ms → ~50ms
+ * 输出:
+ *   1. /semantic_vslam/semantic_map_cloud — 3D 语义着色点云地图
+ *   2. /semantic_vslam/grid_map           — 2D 占据栅格地图 (从 3D 点云投影)
  */
 
 #include "semantic_vslam/semantic_map_node.hpp"
 
+#include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 
@@ -25,8 +22,8 @@ SemanticMapNode::SemanticMapNode()
   // ---- 参数 ----
   this->declare_parameter<std::string>("target_frame", "map");
   this->declare_parameter<double>("voxel_size", 0.02);
-  this->declare_parameter<int>("max_clouds", 150);
-  this->declare_parameter<int>("cloud_decimation", 3);
+  this->declare_parameter<int>("max_clouds", 50);
+  this->declare_parameter<int>("cloud_decimation", 2);
   this->declare_parameter<double>("publish_rate", 1.0);
   this->declare_parameter<double>("grid_cell_size", 0.05);
   this->declare_parameter<double>("grid_min_height", 0.1);
@@ -35,7 +32,6 @@ SemanticMapNode::SemanticMapNode()
 
   target_frame_ = this->get_parameter("target_frame").as_string();
   voxel_size_ = this->get_parameter("voxel_size").as_double();
-  inv_voxel_size_ = static_cast<float>(1.0 / voxel_size_);
   max_clouds_ = this->get_parameter("max_clouds").as_int();
   cloud_decimation_ = this->get_parameter("cloud_decimation").as_int();
   double publish_rate = this->get_parameter("publish_rate").as_double();
@@ -53,15 +49,16 @@ SemanticMapNode::SemanticMapNode()
       "/semantic_vslam/semantic_cloud", 5,
       std::bind(&SemanticMapNode::cloudCallback, this, std::placeholders::_1));
 
-  // ---- 发布 ----
+  // ---- 发布 3D 语义地图 + 2D 栅格地图 ----
   map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/semantic_vslam/semantic_map_cloud", 1);
   grid_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
       "/semantic_vslam/grid_map", 1);
 
-  auto period = std::chrono::milliseconds(
-      static_cast<int>(1000.0 / publish_rate));
-  timer_ = this->create_wall_timer(period,
+  // ---- 定时发布 ----
+  auto period_ms = static_cast<int>(1000.0 / publish_rate);
+  timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(period_ms),
       std::bind(&SemanticMapNode::publishTimer, this));
 
   RCLCPP_INFO(this->get_logger(),
@@ -72,6 +69,9 @@ SemanticMapNode::SemanticMapNode()
 // ---------------------------------------------------------------------------
 void SemanticMapNode::cloudCallback(
     const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+
+  auto t0 = enable_profiling_ ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
 
   // 查找 TF: semantic_cloud frame → map
   geometry_msgs::msg::TransformStamped tf_stamped;
@@ -133,50 +133,36 @@ void SemanticMapNode::cloudCallback(
 // ---------------------------------------------------------------------------
 void SemanticMapNode::publishTimer() {
   auto tp0 = std::chrono::steady_clock::now();
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
+      new pcl::PointCloud<pcl::PointXYZRGB>);
 
-  // ---- 合并滑动窗口内所有帧 ----
-  size_t total_pts = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (cloud_window_.empty()) return;
-    for (const auto &sc : cloud_window_) total_pts += sc.cloud->size();
-  }
 
-  auto tp1 = std::chrono::steady_clock::now();
+    size_t total = 0;
+    for (const auto &sc : cloud_window_) total += sc.cloud->size();
+    merged->reserve(total);
 
-  // ---- 哈希去重 (替代 pcl::VoxelGrid, 快 3-5 倍) ----
-  // 遍历所有点, 按离散化体素坐标去重, 保留最后看到的颜色
-  struct VoxelPt { float x, y, z; uint8_t r, g, b; };
-  std::unordered_map<VoxelKey, VoxelPt, VoxelKeyHash> voxel_map;
-  voxel_map.reserve(total_pts / 2);  // 预分配 (去重后约一半)
-
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto &sc : cloud_window_) {
-      for (const auto &pt : sc.cloud->points) {
-        VoxelKey key;
-        key.x = static_cast<int>(std::floor(pt.x * inv_voxel_size_));
-        key.y = static_cast<int>(std::floor(pt.y * inv_voxel_size_));
-        key.z = static_cast<int>(std::floor(pt.z * inv_voxel_size_));
-
-        // 同一体素: 后来的帧覆盖旧值 (保持最新观测)
-        voxel_map[key] = {pt.x, pt.y, pt.z, pt.r, pt.g, pt.b};
-      }
+      *merged += *(sc.cloud);
     }
   }
 
-  // ---- 构建输出点云 ----
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
-      new pcl::PointCloud<pcl::PointXYZRGB>);
-  merged->reserve(voxel_map.size());
-  for (const auto &[key, v] : voxel_map) {
-    pcl::PointXYZRGB pt;
-    pt.x = v.x; pt.y = v.y; pt.z = v.z;
-    pt.r = v.r; pt.g = v.g; pt.b = v.b;
-    merged->push_back(pt);
-  }
-
   if (merged->empty()) return;
+
+  auto tp1 = std::chrono::steady_clock::now();
+
+  // 体素滤波
+  if (voxel_size_ > 0.0) {
+    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
+    vg.setInputCloud(merged);
+    vg.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered(
+        new pcl::PointCloud<pcl::PointXYZRGB>);
+    vg.filter(*filtered);
+    merged = filtered;
+  }
 
   auto tp2 = std::chrono::steady_clock::now();
 
@@ -191,6 +177,7 @@ void SemanticMapNode::publishTimer() {
 
   // ---- 发布 2D 占据栅格地图 (从 3D 点云投影) ----
   {
+    // 计算边界
     float xMin = 1e9f, xMax = -1e9f, yMin = 1e9f, yMax = -1e9f;
     for (const auto &pt : merged->points) {
       if (pt.x < xMin) xMin = pt.x;
@@ -207,8 +194,10 @@ void SemanticMapNode::publishTimer() {
     if (width <= 0 || height <= 0 || width > 10000 || height > 10000)
       return;
 
+    // 初始化: -1 = unknown
     std::vector<int8_t> grid(width * height, -1);
 
+    // 投影: 按高度分类
     for (const auto &pt : merged->points) {
       int gx = static_cast<int>((pt.x - xMin) / grid_cell_size_);
       int gy = static_cast<int>((pt.y - yMin) / grid_cell_size_);
@@ -216,9 +205,9 @@ void SemanticMapNode::publishTimer() {
 
       int idx = gy * width + gx;
       if (pt.z >= grid_min_height_ && pt.z <= grid_max_height_) {
-        grid[idx] = 100;
+        grid[idx] = 100;  // 障碍
       } else if (grid[idx] != 100) {
-        grid[idx] = 0;
+        grid[idx] = 0;    // 自由 (不覆盖已标记的障碍)
       }
     }
 
@@ -238,13 +227,13 @@ void SemanticMapNode::publishTimer() {
 
   if (enable_profiling_) {
     auto tp3 = std::chrono::steady_clock::now();
-    auto ms_dedup = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
+    auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+    auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
     auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
     auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "[perf] map: dedup=%ldms pub=%ldms total=%ldms | %zu→%zu voxels, %zu frames",
-        ms_dedup, ms_pub, ms_total,
-        total_pts, voxel_map.size(), cloud_window_.size());
+        "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
+        ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
   }
 }
 
