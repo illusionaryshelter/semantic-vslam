@@ -1,4 +1,4 @@
-# 🧠 Semantic VSLAM
+# Semantic VSLAM
 
 > **基于 YOLOv8-seg + RTAB-Map 的实时语义视觉 SLAM 系统**
 >
@@ -8,21 +8,21 @@
 
 ---
 
-## 📐 系统架构
+##  系统架构
 
 ```
                           ┌──────────────────────────────────────────────┐
                           │          semantic_cloud_node                 │
- ┌─────────────┐          │  ┌──────────┐  ┌─────────────────────────┐  │
- │ Astra Pro / │  RGB     │  │ TensorRT │  │ generateSemanticCloud   │  │
- │ RealSense   │─────────▶│  │ YOLOv8   │─▶│ depth→3D + 语义着色      │──┼──▶ /semantic_cloud
- │ (RGB-D)     │  Depth   │  │ -seg     │  │ + 动态物体过滤           │  │   /label_map
+ ┌─────────────┐          │  ┌──────────┐  ┌─────────────────────────┐   │
+ │ Astra Pro / │  RGB     │  │ TensorRT │  │ generateSemanticCloud   │   │
+ │ RealSense   │─────────▶│  │ YOLOv8   │─▶│ depth→3D + 语义着色     │  │──▶ /semantic_cloud
+ │ (RGB-D)     │  Depth   │  │ -seg     │  │ + 动态物体过滤            │  │   /label_map
  └──────┬──────┘─────────▶│  └──────────┘  └─────────────────────────┘  │
         │                 └──────────────────────────────────────────────┘
         │                                          │
         │            ┌──────────────────┐          │          ┌──────────────────┐
         │            │ rgbd_odometry    │          ├─────────▶│ semantic_map_node│
-        └───────────▶│ (官方 rtabmap)    │          │          │ TF累积 + VoxelGrid│
+        └───────────▶│ (官方 rtabmap)   │          │          │ TF累积 + VoxelGrid│
                      └────────┬─────────┘          │          └────────┬─────────┘
                               │                    │                   │
                      ┌────────▼─────────┐          │          /semantic_map_cloud (3D 语义地图)
@@ -48,7 +48,7 @@
 
 ---
 
-## ⚡ 性能
+##  性能
 
 在 **Jetson Orin Nano 8GB** + **Astra Pro 640×480@30fps** 上实测:
 
@@ -84,7 +84,7 @@
 
 ---
 
-## 🛠 依赖
+##  依赖
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
@@ -98,7 +98,7 @@
 
 ---
 
-## 🔨 构建
+##  构建
 
 ```bash
 # 1. 安装 ROS 2 依赖
@@ -127,7 +127,7 @@ source install/setup.bash
 
 ---
 
-## 🚀 运行
+## 运行
 
 ### 完整语义 SLAM 系统
 
@@ -160,7 +160,7 @@ ros2 launch semantic_vslam semantic_slam.launch.py \
 
 ---
 
-## ⚙️ 参数配置
+##  参数配置
 
 所有参数在 `config/params.yaml` 中定义，launch 自动加载。
 
@@ -211,7 +211,7 @@ ros2 launch semantic_vslam semantic_slam.launch.py \
 
 ---
 
-## 📁 项目结构
+##  项目结构
 
 ```
 ANTI/
@@ -258,7 +258,7 @@ ANTI/
 
 ---
 
-## 📷 支持的相机
+##  支持的相机
 
 | 相机 | 色彩编码 | 适配方式 |
 |---|---|---|
@@ -270,7 +270,7 @@ ANTI/
 
 ---
 
-## 🔧 调试
+##  调试
 
 ### 性能分析
 
@@ -283,15 +283,6 @@ ANTI/
 # 方法 2: 运行系统级分析脚本
 bash scripts/profile_system.sh
 ```
-
-### 常见问题
-
-| 问题 | 原因 | 解决 |
-|---|---|---|
-| rtabmap 报 "TF is not set" | Astra 动态 TF 延迟 | launch 已用 static_transform_publisher 解决 |
-| 旋转时墙面重影 | 地图去重精度不足 | 确保使用 `pcl::VoxelGrid` (不可替换为哈希方案) |
-| 物体包围盒不显示 | 异步数据同步问题 | 已修复 (timestamp-based dedup) |
-| 点云有椒盐噪声 | 深度传感器噪声 | 调小 `voxel_size` 或增大 `cloud_decimation` |
 
 ---
 
