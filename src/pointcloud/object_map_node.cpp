@@ -121,8 +121,21 @@ void ObjectMapNode::labelCallback(
 
 // ---------------------------------------------------------------------------
 void ObjectMapNode::processTimer() {
+  auto t0 = std::chrono::steady_clock::now();
   extractObjects();
+  auto t1 = std::chrono::steady_clock::now();
   publishMarkers();
+  auto t2 = std::chrono::steady_clock::now();
+
+  auto ms_extract = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+  auto ms_publish = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+  auto ms_total   = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count();
+
+  if (ms_extract > 0 || ms_publish > 0) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        "[perf] obj: extract=%ldms publish=%ldms total=%ldms | %zu objects",
+        ms_extract, ms_publish, ms_total, object_map_.size());
+  }
 }
 
 // ---------------------------------------------------------------------------

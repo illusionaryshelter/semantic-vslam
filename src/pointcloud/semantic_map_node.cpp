@@ -68,6 +68,8 @@ SemanticMapNode::SemanticMapNode()
 void SemanticMapNode::cloudCallback(
     const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
 
+  auto t0 = std::chrono::steady_clock::now();
+
   // 查找 TF: semantic_cloud frame → map
   geometry_msgs::msg::TransformStamped tf_stamped;
   try {
@@ -127,6 +129,7 @@ void SemanticMapNode::cloudCallback(
 
 // ---------------------------------------------------------------------------
 void SemanticMapNode::publishTimer() {
+  auto tp0 = std::chrono::steady_clock::now();
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
       new pcl::PointCloud<pcl::PointXYZRGB>);
 
@@ -145,6 +148,8 @@ void SemanticMapNode::publishTimer() {
 
   if (merged->empty()) return;
 
+  auto tp1 = std::chrono::steady_clock::now();
+
   // 体素滤波
   if (voxel_size_ > 0.0) {
     pcl::VoxelGrid<pcl::PointXYZRGB> vg;
@@ -155,6 +160,8 @@ void SemanticMapNode::publishTimer() {
     vg.filter(*filtered);
     merged = filtered;
   }
+
+  auto tp2 = std::chrono::steady_clock::now();
 
   // ---- 发布 3D 语义地图 ----
   {
@@ -215,9 +222,15 @@ void SemanticMapNode::publishTimer() {
     grid_pub_->publish(grid_msg);
   }
 
+  auto tp3 = std::chrono::steady_clock::now();
+  auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+  auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
+  auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
+  auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
+
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-      "Semantic map: %zu points, %zu frames | grid published",
-      merged->size(), cloud_window_.size());
+      "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
+      ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
 }
 
 } // namespace semantic_vslam
