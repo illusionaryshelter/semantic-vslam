@@ -43,7 +43,8 @@ struct ObjectInstance {
 
 class ObjectMapNode : public rclcpp::Node {
 public:
-  ObjectMapNode();
+  explicit ObjectMapNode(
+      const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
 private:
   // 同步回调: semantic_cloud + label_map 到达时处理

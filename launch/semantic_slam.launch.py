@@ -16,7 +16,8 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, ComposableNodeContainer, LoadComposableNodes
+from launch_ros.descriptions import ComposableNode
 from launch_ros.substitutions import FindPackageShare
 from launch.launch_description_sources import AnyLaunchDescriptionSource
 
@@ -170,71 +171,100 @@ def generate_launch_description():
         ),
 
         # ============================================================
-        # 4. 语义点云节点 (YOLO 推理)
+        # 4. 语义处理组件容器 (IPC 进程内零拷贝通信)
+        #
+        # 将 3 个自定义节点加载到同一进程:
+        #   - semantic_cloud_node (YOLO 推理 + 语义点云)
+        #   - semantic_map_node   (TF 累积 + 体素滤波)
+        #   - object_map_node     (3D 聚类 + 包围盒)
+        #
+        # use_intra_process_comms=True:
+        #   节点间传递 unique_ptr 消息, 零序列化/零拷贝
+        #   ~19MB/帧 DDS 序列化开销 → 0
         # ============================================================
-        Node(
-            package='semantic_vslam',
-            executable='semantic_cloud_node',
-            name='semantic_cloud_node',
-            parameters=[
-                PathJoinSubstitution([
-                    FindPackageShare('semantic_vslam'),
-                    'config', 'params.yaml'
-                ]),
-                {
-                'engine_path':    LaunchConfiguration('engine_path'),
-                'rgb_topic':      LaunchConfiguration('rgb_topic'),
-                'depth_topic':    LaunchConfiguration('depth_topic'),
-                'cam_info_topic': LaunchConfiguration('cam_info_topic'),
-                'conf_thresh':    LaunchConfiguration('conf_thresh'),
-                'depth_scale':    0.001,
-                },
-            ],
+        ComposableNodeContainer(
+            name='semantic_container',
+            namespace='',
+            package='rclcpp_components',
+            executable='component_container',
             output='screen',
         ),
 
-        # ============================================================
-        # 5. 语义地图累积节点
-        #
-        # 利用官方 rtabmap 的 TF (map→odom→camera_link)
-        # 累积每帧 semantic_cloud 到 map 坐标系
-        # ============================================================
-        Node(
-            package='semantic_vslam',
-            executable='semantic_map_node',
-            name='semantic_map_node',
-            parameters=[
-                PathJoinSubstitution([
-                    FindPackageShare('semantic_vslam'),
-                    'config', 'params.yaml'
-                ]),
-                {
-                'target_frame':     'map',
-                'voxel_size':       0.02,
-                'max_clouds':       150,
-                'cloud_decimation': 3,
-                'publish_rate':     1.0,
-                },
+        # ---- 加载: semantic_cloud_node ----
+        LoadComposableNodes(
+            target_container='semantic_container',
+            composable_node_descriptions=[
+                ComposableNode(
+                    package='semantic_vslam',
+                    plugin='semantic_vslam::SemanticCloudNode',
+                    name='semantic_cloud_node',
+                    parameters=[
+                        PathJoinSubstitution([
+                            FindPackageShare('semantic_vslam'),
+                            'config', 'params.yaml'
+                        ]),
+                        {
+                        'engine_path':    LaunchConfiguration('engine_path'),
+                        'rgb_topic':      LaunchConfiguration('rgb_topic'),
+                        'depth_topic':    LaunchConfiguration('depth_topic'),
+                        'cam_info_topic': LaunchConfiguration('cam_info_topic'),
+                        'conf_thresh':    LaunchConfiguration('conf_thresh'),
+                        'depth_scale':    0.001,
+                        },
+                    ],
+                    extra_arguments=[
+                        {'use_intra_process_comms': True},
+                    ],
+                ),
             ],
-            output='screen',
         ),
 
-        # ============================================================
-        # 6. 物体级语义地图节点
-        #
-        # 从 semantic_cloud + label_map 提取静态物体的 3D 包围盒
-        # 发布 MarkerArray 供 RViz 可视化
-        # ============================================================
-        Node(
-            package='semantic_vslam',
-            executable='object_map_node',
-            name='object_map_node',
-            parameters=[
-                PathJoinSubstitution([
-                    FindPackageShare('semantic_vslam'),
-                    'config', 'params.yaml'
-                ]),
+        # ---- 加载: semantic_map_node ----
+        LoadComposableNodes(
+            target_container='semantic_container',
+            composable_node_descriptions=[
+                ComposableNode(
+                    package='semantic_vslam',
+                    plugin='semantic_vslam::SemanticMapNode',
+                    name='semantic_map_node',
+                    parameters=[
+                        PathJoinSubstitution([
+                            FindPackageShare('semantic_vslam'),
+                            'config', 'params.yaml'
+                        ]),
+                        {
+                        'target_frame':     'map',
+                        'voxel_size':       0.02,
+                        'max_clouds':       150,
+                        'cloud_decimation': 3,
+                        'publish_rate':     1.0,
+                        },
+                    ],
+                    extra_arguments=[
+                        {'use_intra_process_comms': True},
+                    ],
+                ),
             ],
-            output='screen',
+        ),
+
+        # ---- 加载: object_map_node ----
+        LoadComposableNodes(
+            target_container='semantic_container',
+            composable_node_descriptions=[
+                ComposableNode(
+                    package='semantic_vslam',
+                    plugin='semantic_vslam::ObjectMapNode',
+                    name='object_map_node',
+                    parameters=[
+                        PathJoinSubstitution([
+                            FindPackageShare('semantic_vslam'),
+                            'config', 'params.yaml'
+                        ]),
+                    ],
+                    extra_arguments=[
+                        {'use_intra_process_comms': True},
+                    ],
+                ),
+            ],
         ),
     ])

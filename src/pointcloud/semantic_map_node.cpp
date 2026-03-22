@@ -1,5 +1,5 @@
 /**
- * semantic_map_node.cpp
+ * semantic_map_node.cpp  (ROS 2 Component)
  *
  * 语义地图累积节点
  *
@@ -16,8 +16,8 @@
 
 namespace semantic_vslam {
 
-SemanticMapNode::SemanticMapNode()
-    : Node("semantic_map_node") {
+SemanticMapNode::SemanticMapNode(const rclcpp::NodeOptions &options)
+    : Node("semantic_map_node", options) {
 
   // ---- 参数 ----
   this->declare_parameter<std::string>("target_frame", "map");
@@ -239,11 +239,5 @@ void SemanticMapNode::publishTimer() {
 
 } // namespace semantic_vslam
 
-// ---- main ----
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<semantic_vslam::SemanticMapNode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(semantic_vslam::SemanticMapNode)

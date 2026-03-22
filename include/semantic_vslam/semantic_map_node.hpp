@@ -28,7 +28,8 @@ namespace semantic_vslam {
 
 class SemanticMapNode : public rclcpp::Node {
 public:
-  SemanticMapNode();
+  explicit SemanticMapNode(
+      const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 
 private:
   /// 每帧语义点云回调

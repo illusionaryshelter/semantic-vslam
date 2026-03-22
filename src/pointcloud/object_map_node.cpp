@@ -1,5 +1,5 @@
 /**
- * object_map_node.cpp
+ * object_map_node.cpp  (ROS 2 Component)
  *
  * 物体级语义地图: 从 YOLO 分割 + 深度 → 3D 包围盒 → 跨帧物体地图
  *
@@ -62,8 +62,8 @@ static const char* kCocoNames[] = {
 };
 
 // ---------------------------------------------------------------------------
-ObjectMapNode::ObjectMapNode()
-    : Node("object_map_node") {
+ObjectMapNode::ObjectMapNode(const rclcpp::NodeOptions &options)
+    : Node("object_map_node", options) {
 
   // ---- 参数 ----
   this->declare_parameter<std::string>("target_frame", "map");
@@ -474,11 +474,5 @@ void ObjectMapNode::publishMarkers() {
 
 } // namespace semantic_vslam
 
-// ---- main ----
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<semantic_vslam::ObjectMapNode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(semantic_vslam::ObjectMapNode)

@@ -74,17 +74,34 @@ add_executable(test_yolo_inference src/model_inference/test_yolo_inference.cpp)
 target_link_libraries(test_yolo_inference yolo_inference ${OpenCV_LIBS})
 
 # =============================================================================
-# semantic_cloud_node (ROS2 语义点云节点)
+# ROS 2 组件化 (IPC 进程内零拷贝通信)
+#
+# 3 个自定义节点编译为共享库 (组件), 可加载到同一进程中。
+# 同时保留独立可执行文件供单节点调试。
 # =============================================================================
-add_executable(semantic_cloud_node src/pointcloud/semantic_cloud_node.cpp)
-target_link_libraries(semantic_cloud_node
+find_package(rclcpp_components REQUIRED)
+
+# ---- semantic_cloud_node (组件库) ----
+add_library(semantic_cloud_component SHARED
+  src/pointcloud/semantic_cloud_node.cpp
+)
+target_link_libraries(semantic_cloud_component
   yolo_inference
   ${OpenCV_LIBS}
   ${PCL_LIBRARIES}
 )
-ament_target_dependencies(semantic_cloud_node
-  rclcpp sensor_msgs cv_bridge message_filters image_transport pcl_conversions
+ament_target_dependencies(semantic_cloud_component
+  rclcpp rclcpp_components
+  sensor_msgs cv_bridge message_filters image_transport pcl_conversions
 )
+rclcpp_components_register_nodes(semantic_cloud_component
+  "semantic_vslam::SemanticCloudNode"
+)
+
+# ---- semantic_cloud_node (独立可执行文件, 调试用) ----
+add_executable(semantic_cloud_node src/pointcloud/semantic_cloud_main.cpp)
+target_link_libraries(semantic_cloud_node semantic_cloud_component)
+ament_target_dependencies(semantic_cloud_node rclcpp)
 
 # === test_semantic_cloud (独立语义点云测试，不依赖 ROS) ===
 add_executable(test_semantic_cloud src/pointcloud/test_semantic_cloud.cpp)
@@ -141,20 +158,42 @@ ament_target_dependencies(rtabmap_slam_node
   rclcpp sensor_msgs nav_msgs cv_bridge message_filters pcl_conversions
 )
 
-# === semantic_map_node (语义地图累积 — 用 TF 变换 + 体素滤波) ===
-add_executable(semantic_map_node src/pointcloud/semantic_map_node.cpp)
-target_link_libraries(semantic_map_node ${PCL_LIBRARIES})
-ament_target_dependencies(semantic_map_node
-  rclcpp sensor_msgs nav_msgs pcl_conversions tf2_ros tf2_geometry_msgs tf2_eigen
+# ---- semantic_map_node (组件库) ----
+add_library(semantic_map_component SHARED
+  src/pointcloud/semantic_map_node.cpp
+)
+target_link_libraries(semantic_map_component ${PCL_LIBRARIES})
+ament_target_dependencies(semantic_map_component
+  rclcpp rclcpp_components
+  sensor_msgs nav_msgs pcl_conversions tf2_ros tf2_geometry_msgs tf2_eigen
+)
+rclcpp_components_register_nodes(semantic_map_component
+  "semantic_vslam::SemanticMapNode"
 )
 
-# === object_map_node (物体级语义地图 — 3D 包围盒) ===
-add_executable(object_map_node src/pointcloud/object_map_node.cpp)
-target_link_libraries(object_map_node ${PCL_LIBRARIES} ${OpenCV_LIBS})
-ament_target_dependencies(object_map_node
-  rclcpp sensor_msgs visualization_msgs pcl_conversions
+# ---- semantic_map_node (独立可执行文件) ----
+add_executable(semantic_map_node src/pointcloud/semantic_map_main.cpp)
+target_link_libraries(semantic_map_node semantic_map_component)
+ament_target_dependencies(semantic_map_node rclcpp)
+
+# ---- object_map_node (组件库) ----
+add_library(object_map_component SHARED
+  src/pointcloud/object_map_node.cpp
+)
+target_link_libraries(object_map_component ${PCL_LIBRARIES} ${OpenCV_LIBS})
+ament_target_dependencies(object_map_component
+  rclcpp rclcpp_components
+  sensor_msgs visualization_msgs pcl_conversions
   tf2_ros tf2_geometry_msgs tf2_eigen cv_bridge
 )
+rclcpp_components_register_nodes(object_map_component
+  "semantic_vslam::ObjectMapNode"
+)
+
+# ---- object_map_node (独立可执行文件) ----
+add_executable(object_map_node src/pointcloud/object_map_main.cpp)
+target_link_libraries(object_map_node object_map_component)
+ament_target_dependencies(object_map_node rclcpp)
 
 # === test_yolo_unit (YOLO 单元测试) ===
 add_executable(test_yolo_unit src/model_inference/test_yolo_unit.cpp)
@@ -183,7 +222,11 @@ target_link_libraries(test_yolo_realtime yolo_inference ${OpenCV_LIBS})
 # =============================================================================
 # Install
 # =============================================================================
-install(TARGETS yolo_inference
+install(TARGETS
+  yolo_inference
+  semantic_cloud_component
+  semantic_map_component
+  object_map_component
   LIBRARY DESTINATION lib
 )
 install(TARGETS

@@ -376,13 +376,5 @@ void SemanticCloudNode::generateSemanticCloud(
 
 } // namespace semantic_vslam
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<semantic_vslam::SemanticCloudNode>();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(semantic_vslam::SemanticCloudNode)
