@@ -206,4 +206,23 @@ def generate_launch_description():
             }],
             output='screen',
         ),
+
+        # ============================================================
+        # 6. 物体级语义地图节点
+        #
+        # 从 semantic_cloud + label_map 提取静态物体的 3D 包围盒
+        # 发布 MarkerArray 供 RViz 可视化
+        # ============================================================
+        Node(
+            package='semantic_vslam',
+            executable='object_map_node',
+            name='object_map_node',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+            ],
+            output='screen',
+        ),
     ])

@@ -30,6 +30,7 @@ find_package(message_filters REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -147,6 +148,14 @@ ament_target_dependencies(semantic_map_node
   rclcpp sensor_msgs nav_msgs pcl_conversions tf2_ros tf2_geometry_msgs tf2_eigen
 )
 
+# === object_map_node (物体级语义地图 — 3D 包围盒) ===
+add_executable(object_map_node src/pointcloud/object_map_node.cpp)
+target_link_libraries(object_map_node ${PCL_LIBRARIES} ${OpenCV_LIBS})
+ament_target_dependencies(object_map_node
+  rclcpp sensor_msgs visualization_msgs pcl_conversions
+  tf2_ros tf2_geometry_msgs tf2_eigen cv_bridge
+)
+
 # === test_yolo_unit (YOLO 单元测试) ===
 add_executable(test_yolo_unit src/model_inference/test_yolo_unit.cpp)
 target_link_libraries(test_yolo_unit yolo_inference ${OpenCV_LIBS})
@@ -181,6 +190,7 @@ install(TARGETS
   semantic_cloud_node
   rtabmap_slam_node
   semantic_map_node
+  object_map_node
   test_yolo_inference
   test_semantic_cloud
   test_yolo_unit
