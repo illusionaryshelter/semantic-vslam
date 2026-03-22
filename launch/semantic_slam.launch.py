@@ -170,23 +170,19 @@ def generate_launch_description():
             }.items(),
         ),
 
+
+
         # ============================================================
-        # 4. 语义处理组件容器 (IPC 进程内零拷贝通信)
+        # 4. 快进程: IPC 容器 (semantic_cloud + object_map)
         #
-        # 将 3 个自定义节点加载到同一进程:
-        #   - semantic_cloud_node (YOLO 推理 + 语义点云)
-        #   - semantic_map_node   (TF 累积 + 体素滤波)
-        #   - object_map_node     (3D 聚类 + 包围盒)
-        #
-        # use_intra_process_comms=True:
-        #   节点间传递 unique_ptr 消息, 零序列化/零拷贝
-        #   ~19MB/帧 DDS 序列化开销 → 0
+        # 高频高带宽节点共享进程, 零拷贝传递 9.4MB PointCloud2
+        # 单线程: 只有 2 个节点, cloud 回调轻量 (store latest)
         # ============================================================
         ComposableNodeContainer(
             name='semantic_container',
             namespace='',
             package='rclcpp_components',
-            executable='component_container_mt',  # 多线程: 各节点回调并行执行
+            executable='component_container',  # 单线程: 2 节点无竞争
             output='screen',
         ),
 
@@ -219,34 +215,6 @@ def generate_launch_description():
             ],
         ),
 
-        # ---- 加载: semantic_map_node ----
-        LoadComposableNodes(
-            target_container='semantic_container',
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='semantic_vslam',
-                    plugin='semantic_vslam::SemanticMapNode',
-                    name='semantic_map_node',
-                    parameters=[
-                        PathJoinSubstitution([
-                            FindPackageShare('semantic_vslam'),
-                            'config', 'params.yaml'
-                        ]),
-                        {
-                        'target_frame':     'map',
-                        'voxel_size':       0.02,
-                        'max_clouds':       150,
-                        'cloud_decimation': 3,
-                        'publish_rate':     1.0,
-                        },
-                    ],
-                    extra_arguments=[
-                        {'use_intra_process_comms': True},
-                    ],
-                ),
-            ],
-        ),
-
         # ---- 加载: object_map_node ----
         LoadComposableNodes(
             target_container='semantic_container',
@@ -267,4 +235,31 @@ def generate_launch_description():
                 ),
             ],
         ),
+
+        # ============================================================
+        # 5. 慢进程: 语义地图累积 (独立进程)
+        #
+        # VoxelGrid 700ms @ 1Hz — 内存密集, 物理隔离避免
+        # 与 YOLO 推理争夺 L2 cache
+        # ============================================================
+        Node(
+            package='semantic_vslam',
+            executable='semantic_map_node',
+            name='semantic_map_node',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+                {
+                'target_frame':     'map',
+                'voxel_size':       0.02,
+                'max_clouds':       150,
+                'cloud_decimation': 3,
+                'publish_rate':     1.0,
+                },
+            ],
+            output='screen',
+        ),
     ])
+
