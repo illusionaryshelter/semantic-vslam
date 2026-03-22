@@ -169,7 +169,7 @@ void ObjectMapNode::extractObjects() {
   try {
     auto tf_stamped = tf_buffer_->lookupTransform(
         target_frame_, cloud_msg->header.frame_id,
-        tf2::TimePointZero, tf2::durationFromSec(0.05));
+        tf2::TimePointZero, tf2::durationFromSec(0.1));
     Eigen::Isometry3d tf_eigen = tf2::transformToEigen(tf_stamped.transform);
     tf_mat = tf_eigen.matrix().cast<float>();
   } catch (const tf2::TransformException &ex) {

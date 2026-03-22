@@ -211,7 +211,8 @@ def generate_launch_description():
                 {
                 'target_frame':     'map',
                 'voxel_size':       0.02,
-                'cloud_decimation': 2,
+                'max_clouds':       150,
+                'cloud_decimation': 3,
                 'publish_rate':     1.0,
                 },
             ],

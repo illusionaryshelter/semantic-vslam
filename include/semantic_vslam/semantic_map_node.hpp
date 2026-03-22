@@ -2,19 +2,16 @@
 /**
  * semantic_map_node.hpp
  *
- * 语义地图累积节点 — 体素哈希表累积器
+ * 语义地图累积节点
  *
- * 使用空间哈希表 (VoxelHashMap) 持久化存储地图:
- *   - 新点插入/更新已有体素 (颜色加权平均)
- *   - 定时清理长时间未更新的体素
- *   - 发布时直接序列化哈希表 → 零额外滤波开销
+ * 功能: 订阅每帧语义点云 (semantic_cloud)，利用官方 rtabmap 发布的
+ *       TF 树 (map→odom→camera_link→camera_color_optical_frame) 将
+ *       每帧点云变换到 map 坐标系，累积后发布。
  *
- * 优势 vs 滑动窗口:
- *   - 地图持久化 (不会因帧推出窗口而消失)
- *   - 零重影 (同一体素只有一个点)
- *   - O(新帧点数) 每次回调, 发布时 O(地图大小)
+ * 使用滑动窗口管理时间维度 + 哈希去重替代 pcl::VoxelGrid (高性能)
  */
 
+#include <deque>
 #include <mutex>
 #include <unordered_map>
 
@@ -51,7 +48,15 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  // ---- 体素哈希表 ----
+  // ---- 累积点云 (sliding window) ----
+  struct StampedCloud {
+    rclcpp::Time stamp;
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
+  };
+  std::deque<StampedCloud> cloud_window_;
+  std::mutex mutex_;
+
+  // ---- 哈希去重用的 key ----
   struct VoxelKey {
     int x, y, z;
     bool operator==(const VoxelKey &o) const {
@@ -60,7 +65,6 @@ private:
   };
   struct VoxelKeyHash {
     size_t operator()(const VoxelKey &k) const {
-      // FNV-1a 风格哈希
       size_t h = 2166136261u;
       h ^= std::hash<int>()(k.x); h *= 16777619u;
       h ^= std::hash<int>()(k.y); h *= 16777619u;
@@ -68,24 +72,16 @@ private:
       return h;
     }
   };
-  struct VoxelData {
-    float r, g, b;       // 累积颜色 (加权)
-    float x, y, z;       // 体素内点的均值坐标
-    int count;           // 累积观测计数
-    double last_update;  // 最后更新时间 (秒)
-  };
-  std::unordered_map<VoxelKey, VoxelData, VoxelKeyHash> voxel_map_;
-  std::mutex mutex_;
 
   // ---- 参数 ----
   std::string target_frame_;   // "map"
   double voxel_size_;          // 体素尺寸 (m)
-  double inv_voxel_size_;      // 1.0 / voxel_size_ (避免重复除法)
+  float inv_voxel_size_;       // 1.0 / voxel_size_
+  int max_clouds_;             // 滑动窗口帧数
   int cloud_decimation_;       // 输入点云抽稀
   double grid_cell_size_;      // 2D 栅格分辨率 (m)
   double grid_min_height_;     // 障碍物最低高度 (m)
   double grid_max_height_;     // 障碍物最高高度 (m)
-  double voxel_ttl_;           // 体素存活时间 (秒)
   bool enable_profiling_ = false;
 };
 

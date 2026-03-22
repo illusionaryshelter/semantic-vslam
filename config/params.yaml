@@ -22,8 +22,8 @@ semantic_map_node:
     # 地图参数
     target_frame: "map"       # 累积点云的目标坐标系
     voxel_size: 0.02          # 体素尺寸 (m), 越小越精细
-    cloud_decimation: 2       # 输入点云抽稀倍率 (2 = 每隔 1 个取 1 个)
-    voxel_ttl: 120.0          # 体素存活时间 (秒), 超时则清理
+    max_clouds: 150           # 滑动窗口帧数
+    cloud_decimation: 3       # 输入点云抽稀倍率
     enable_profiling: false
 
     # 2D 栅格参数
