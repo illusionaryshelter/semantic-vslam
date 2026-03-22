@@ -186,7 +186,7 @@ def generate_launch_description():
             name='semantic_container',
             namespace='',
             package='rclcpp_components',
-            executable='component_container',
+            executable='component_container_mt',  # 多线程: 各节点回调并行执行
             output='screen',
         ),
 
