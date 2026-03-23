@@ -22,7 +22,7 @@ SemanticMapNode::SemanticMapNode(const rclcpp::NodeOptions &options)
   // ---- 参数 ----
   this->declare_parameter<std::string>("target_frame", "map");
   this->declare_parameter<double>("voxel_size", 0.02);
-  this->declare_parameter<int>("max_clouds", 50);
+  this->declare_parameter<int>("max_clouds", 50);  // 保留兼容性但不再使用
   this->declare_parameter<int>("cloud_decimation", 2);
   this->declare_parameter<double>("publish_rate", 1.0);
   this->declare_parameter<double>("grid_cell_size", 0.05);
@@ -32,7 +32,6 @@ SemanticMapNode::SemanticMapNode(const rclcpp::NodeOptions &options)
 
   target_frame_ = this->get_parameter("target_frame").as_string();
   voxel_size_ = this->get_parameter("voxel_size").as_double();
-  max_clouds_ = this->get_parameter("max_clouds").as_int();
   cloud_decimation_ = this->get_parameter("cloud_decimation").as_int();
   double publish_rate = this->get_parameter("publish_rate").as_double();
   grid_cell_size_ = this->get_parameter("grid_cell_size").as_double();
@@ -61,9 +60,12 @@ SemanticMapNode::SemanticMapNode(const rclcpp::NodeOptions &options)
       std::chrono::milliseconds(period_ms),
       std::bind(&SemanticMapNode::publishTimer, this));
 
+  // ---- 初始化增量式全局地图 ----
+  incremental_grid_ = std::make_unique<CudaIncrementalVoxelGrid>(voxel_size_);
+
   RCLCPP_INFO(this->get_logger(),
-      "SemanticMapNode ready. voxel=%.3f, grid_cell=%.3f, max_clouds=%d",
-      voxel_size_, grid_cell_size_, max_clouds_);
+      "SemanticMapNode ready (incremental). voxel=%.3f, grid_cell=%.3f",
+      voxel_size_, grid_cell_size_);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,12 +127,14 @@ void SemanticMapNode::cloudCallback(
   transformed->height = 1;
   transformed->is_dense = true;
 
-  // 添加到 sliding window
+  // 存储待融合帧 (线程安全: callback → timer)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    cloud_window_.push_back({msg->header.stamp, transformed});
-    while (static_cast<int>(cloud_window_.size()) > max_clouds_) {
-      cloud_window_.pop_front();
+    if (!pending_cloud_) {
+      pending_cloud_ = transformed;
+    } else {
+      // 如果 timer 还没来得及处理, 合并多帧
+      *pending_cloud_ += *transformed;
     }
   }
 }
@@ -138,40 +142,29 @@ void SemanticMapNode::cloudCallback(
 // ---------------------------------------------------------------------------
 void SemanticMapNode::publishTimer() {
   auto tp0 = std::chrono::steady_clock::now();
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr merged(
-      new pcl::PointCloud<pcl::PointXYZRGB>);
 
+  // 取出待融合帧
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr new_cloud;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (cloud_window_.empty()) return;
-
-    size_t total = 0;
-    for (const auto &sc : cloud_window_) total += sc.cloud->size();
-    merged->reserve(total);
-
-    for (const auto &sc : cloud_window_) {
-      *merged += *(sc.cloud);
-    }
+    new_cloud = pending_cloud_;
+    pending_cloud_.reset();
   }
 
-  if (merged->empty()) return;
+  // 增量融合到全局地图
+  if (new_cloud && !new_cloud->empty()) {
+    incremental_grid_->addCloud(*new_cloud);
+  }
+
+  const auto& map = incremental_grid_->getMap();
+  if (map.empty()) return;
 
   auto tp1 = std::chrono::steady_clock::now();
-
-  // 体素滤波 (CUDA 加速)
-  if (voxel_size_ > 0.0) {
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered(
-        new pcl::PointCloud<pcl::PointXYZRGB>);
-    semantic_vslam::cudaVoxelGridFilter(*merged, *filtered, voxel_size_);
-    merged = filtered;
-  }
-
-  auto tp2 = std::chrono::steady_clock::now();
 
   // ---- 发布 3D 语义地图 ----
   {
     sensor_msgs::msg::PointCloud2 pc2;
-    pcl::toROSMsg(*merged, pc2);
+    pcl::toROSMsg(map, pc2);
     pc2.header.stamp = this->now();
     pc2.header.frame_id = target_frame_;
     map_pub_->publish(pc2);
@@ -179,9 +172,8 @@ void SemanticMapNode::publishTimer() {
 
   // ---- 发布 2D 占据栅格地图 (从 3D 点云投影) ----
   {
-    // 计算边界
     float xMin = 1e9f, xMax = -1e9f, yMin = 1e9f, yMax = -1e9f;
-    for (const auto &pt : merged->points) {
+    for (const auto &pt : map.points) {
       if (pt.x < xMin) xMin = pt.x;
       if (pt.x > xMax) xMax = pt.x;
       if (pt.y < yMin) yMin = pt.y;
@@ -196,20 +188,18 @@ void SemanticMapNode::publishTimer() {
     if (width <= 0 || height <= 0 || width > 10000 || height > 10000)
       return;
 
-    // 初始化: -1 = unknown
     std::vector<int8_t> grid(width * height, -1);
 
-    // 投影: 按高度分类
-    for (const auto &pt : merged->points) {
+    for (const auto &pt : map.points) {
       int gx = static_cast<int>((pt.x - xMin) / grid_cell_size_);
       int gy = static_cast<int>((pt.y - yMin) / grid_cell_size_);
       if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
 
       int idx = gy * width + gx;
       if (pt.z >= grid_min_height_ && pt.z <= grid_max_height_) {
-        grid[idx] = 100;  // 障碍
+        grid[idx] = 100;
       } else if (grid[idx] != 100) {
-        grid[idx] = 0;    // 自由 (不覆盖已标记的障碍)
+        grid[idx] = 0;
       }
     }
 
@@ -228,14 +218,13 @@ void SemanticMapNode::publishTimer() {
   }
 
   if (enable_profiling_) {
-    auto tp3 = std::chrono::steady_clock::now();
-    auto ms_merge = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
-    auto ms_voxel = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
-    auto ms_pub   = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp2).count();
-    auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp3 - tp0).count();
+    auto tp2 = std::chrono::steady_clock::now();
+    auto ms_add = std::chrono::duration_cast<std::chrono::milliseconds>(tp1 - tp0).count();
+    auto ms_pub = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp1).count();
+    auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(tp2 - tp0).count();
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "[perf] map: merge=%ldms voxel=%ldms pub=%ldms total=%ldms | %zu pts, %zu frames",
-        ms_merge, ms_voxel, ms_pub, ms_total, merged->size(), cloud_window_.size());
+        "[perf] map: add=%ldms pub=%ldms total=%ldms | %zu pts (global)",
+        ms_add, ms_pub, ms_total, map.size());
   }
 }
 

@@ -80,4 +80,61 @@ void cudaVoxelGridFilter(const pcl::PointCloud<pcl::PointXYZRGB> &input,
   }
 }
 
+// ============================================================================
+// CudaIncrementalVoxelGrid 实现
+// ============================================================================
+
+CudaIncrementalVoxelGrid::CudaIncrementalVoxelGrid(float voxel_size)
+    : voxel_size_(voxel_size) {}
+
+void CudaIncrementalVoxelGrid::addCloud(
+    const pcl::PointCloud<pcl::PointXYZRGB>& new_cloud) {
+  if (new_cloud.empty()) return;
+
+  const int M = static_cast<int>(global_map_.size());  // 现有地图点数
+  const int N = static_cast<int>(new_cloud.size());     // 新帧点数
+  const int total = M + N;
+
+  // 确保 managed 缓冲区容量 (复用全局持久缓冲区)
+  ensureManagedBuffers(total);
+
+  // ---- 拼接: 先放现有地图 (保证 sort 稳定性下现有点优先) ----
+  // 现有地图点已经是 voxelized 的, 直接写入 managed memory
+  for (int i = 0; i < M; ++i) {
+    const auto& pt = global_map_.points[i];
+    g_managed_input[i] = {pt.x, pt.y, pt.z, pt.r, pt.g, pt.b, 0};
+  }
+  // 追加新帧
+  for (int i = 0; i < N; ++i) {
+    const auto& pt = new_cloud.points[i];
+    g_managed_input[M + i] = {pt.x, pt.y, pt.z, pt.r, pt.g, pt.b, 0};
+  }
+
+  // ---- CUDA VoxelGrid (sort_by_key + dedup) ----
+  // 相同 voxel 的点排序后相邻, first-point 策略保留现有地图的颜色
+  // (因为现有地图的点在数组前面, sort 是 stable 对相同 key 保序)
+  int num_out = cudaVoxelGridFilterRaw(
+      g_managed_input, total, g_managed_output, total, voxel_size_);
+
+  // ---- 更新全局地图 ----
+  global_map_.resize(num_out);
+  global_map_.width = num_out;
+  global_map_.height = 1;
+  global_map_.is_dense = true;
+
+  for (int i = 0; i < num_out; ++i) {
+    auto& op = global_map_.points[i];
+    op.x = g_managed_output[i].x;
+    op.y = g_managed_output[i].y;
+    op.z = g_managed_output[i].z;
+    op.r = g_managed_output[i].r;
+    op.g = g_managed_output[i].g;
+    op.b = g_managed_output[i].b;
+  }
+}
+
+void CudaIncrementalVoxelGrid::clear() {
+  global_map_.clear();
+}
+
 } // namespace semantic_vslam

@@ -24,6 +24,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include "semantic_vslam/cuda_voxel_grid.hpp"
+
 namespace semantic_vslam {
 
 class SemanticMapNode : public rclcpp::Node {
@@ -48,18 +50,14 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  // ---- 累积点云 (sliding window) ----
-  struct StampedCloud {
-    rclcpp::Time stamp;
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
-  };
-  std::deque<StampedCloud> cloud_window_;
+  // ---- 增量式全局地图 (替代 sliding window) ----
+  std::unique_ptr<CudaIncrementalVoxelGrid> incremental_grid_;
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr pending_cloud_;  // 待融合帧 (callback→timer线程安全)
   std::mutex mutex_;
 
   // ---- 参数 ----
   std::string target_frame_;   // "map"
   double voxel_size_;          // 体素滤波尺寸 (m)
-  int max_clouds_;             // 滑动窗口帧数
   int cloud_decimation_;       // 输入点云抽稀 (性能优化)
   double grid_cell_size_;      // 2D 栅格分辨率 (m)
   double grid_min_height_;     // 障碍物最低高度 (m)
