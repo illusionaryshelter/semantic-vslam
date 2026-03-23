@@ -18,6 +18,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED True)
+set(CMAKE_CUDA_ARCHITECTURES 87)  # Jetson Orin Nano = SM 8.7
 
 # =============================================================================
 # Dependencies
@@ -159,11 +160,23 @@ ament_target_dependencies(rtabmap_slam_node
   rclcpp sensor_msgs nav_msgs cv_bridge message_filters pcl_conversions
 )
 
+# ---- cuda_voxel_grid library (GPU 加速 VoxelGrid) ----
+add_library(cuda_voxel_grid SHARED
+  src/pointcloud/cuda_voxel_grid.cu
+  src/pointcloud/cuda_voxel_grid_wrapper.cpp
+)
+set_target_properties(cuda_voxel_grid PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(cuda_voxel_grid PRIVATE include ${PCL_INCLUDE_DIRS})
+target_link_libraries(cuda_voxel_grid ${CUDA_CUDART_LIBRARY} ${PCL_LIBRARIES})
+
 # ---- semantic_map_node (组件库) ----
 add_library(semantic_map_component SHARED
   src/pointcloud/semantic_map_node.cpp
 )
-target_link_libraries(semantic_map_component ${PCL_LIBRARIES})
+target_link_libraries(semantic_map_component ${PCL_LIBRARIES} cuda_voxel_grid)
 ament_target_dependencies(semantic_map_component
   rclcpp rclcpp_components
   sensor_msgs nav_msgs pcl_conversions tf2_ros tf2_geometry_msgs tf2_eigen
@@ -220,6 +233,16 @@ target_link_libraries(test_pipeline
 add_executable(test_yolo_realtime src/model_inference/test_yolo_realtime.cpp)
 target_link_libraries(test_yolo_realtime yolo_inference ${OpenCV_LIBS})
 
+# === test_cuda_voxel_grid (CUDA VoxelGrid 单元测试) ===
+add_executable(test_cuda_voxel_grid src/pointcloud/test_cuda_voxel_grid.cpp)
+target_include_directories(test_cuda_voxel_grid PRIVATE include ${PCL_INCLUDE_DIRS})
+target_link_libraries(test_cuda_voxel_grid cuda_voxel_grid ${PCL_LIBRARIES})
+
+# === test_cupcl_benchmark (对标 NVIDIA cuPCL 官方 benchmark) ===
+add_executable(test_cupcl_benchmark src/pointcloud/test_cupcl_benchmark.cpp)
+target_include_directories(test_cupcl_benchmark PRIVATE include ${PCL_INCLUDE_DIRS})
+target_link_libraries(test_cupcl_benchmark cuda_voxel_grid ${PCL_LIBRARIES})
+
 # =============================================================================
 # Install
 # =============================================================================
@@ -228,6 +251,7 @@ install(TARGETS
   semantic_cloud_component
   semantic_map_component
   object_map_component
+  cuda_voxel_grid
   LIBRARY DESTINATION lib
 )
 install(TARGETS
@@ -241,6 +265,8 @@ install(TARGETS
   test_semantic_cloud_unit
   test_pipeline
   test_yolo_realtime
+  test_cuda_voxel_grid
+  test_cupcl_benchmark
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)

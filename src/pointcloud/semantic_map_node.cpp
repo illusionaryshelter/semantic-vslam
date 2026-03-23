@@ -10,7 +10,7 @@
 
 #include "semantic_vslam/semantic_map_node.hpp"
 
-#include <pcl/filters/voxel_grid.h>
+#include "semantic_vslam/cuda_voxel_grid.hpp"
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 
@@ -74,15 +74,20 @@ void SemanticMapNode::cloudCallback(
                                : std::chrono::steady_clock::time_point{};
 
   // 查找 TF: semantic_cloud frame → map
+  // 关键: 必须用消息时间戳查 TF, 不能用 TimePointZero (最新 TF)
+  //       否则快速旋转时位姿偏移 → 重影
   geometry_msgs::msg::TransformStamped tf_stamped;
   try {
+    // 优先使用精确时间戳 (等待 50ms 让 TF 可用)
     tf_stamped = tf_buffer_->lookupTransform(
         target_frame_, msg->header.frame_id,
-        tf2::TimePointZero,
-        tf2::durationFromSec(0.1));
+        msg->header.stamp,
+        tf2::durationFromSec(0.05));
   } catch (const tf2::TransformException &ex) {
+    // 精确时间戳不可用时, 跳过此帧 (不用 TimePointZero 替代!)
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-        "TF lookup failed: %s", ex.what());
+        "TF lookup failed (ts=%u.%u): %s",
+        msg->header.stamp.sec, msg->header.stamp.nanosec, ex.what());
     return;
   }
 
@@ -153,14 +158,11 @@ void SemanticMapNode::publishTimer() {
 
   auto tp1 = std::chrono::steady_clock::now();
 
-  // 体素滤波
+  // 体素滤波 (CUDA 加速)
   if (voxel_size_ > 0.0) {
-    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
-    vg.setInputCloud(merged);
-    vg.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered(
         new pcl::PointCloud<pcl::PointXYZRGB>);
-    vg.filter(*filtered);
+    semantic_vslam::cudaVoxelGridFilter(*merged, *filtered, voxel_size_);
     merged = filtered;
   }
 

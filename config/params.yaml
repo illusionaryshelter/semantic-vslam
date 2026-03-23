@@ -14,7 +14,7 @@ semantic_cloud_node:
     conf_thresh: 0.4          # YOLO 置信度阈值 (0.0-1.0)
     iou_thresh: 0.45          # NMS IoU 阈值
     depth_scale: 0.001        # 深度缩放 (Astra Pro: 0.001 = mm→m)
-    enable_profiling: false   # 开启则打印 [perf] 性能日志
+    enable_profiling: true    # 开启则打印 [perf] 性能日志
 
 # ---- 语义地图累积节点 (semantic_map_node) ----
 semantic_map_node:
@@ -24,7 +24,7 @@ semantic_map_node:
     voxel_size: 0.02          # 体素尺寸 (m), 越小越精细
     max_clouds: 150           # 滑动窗口帧数
     cloud_decimation: 3       # 输入点云抽稀倍率
-    enable_profiling: false
+    enable_profiling: true
 
     # 2D 栅格参数
     publish_rate: 1.0         # 地图发布频率 (Hz)
@@ -40,4 +40,4 @@ object_map_node:
     merge_distance: 0.5       # 同类物体合并距离 (m)
     max_objects: 50            # 最大跟踪物体数
     publish_rate: 2.0          # MarkerArray 发布频率 (Hz)
-    enable_profiling: false
+    enable_profiling: true

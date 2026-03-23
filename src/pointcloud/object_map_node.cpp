@@ -169,12 +169,12 @@ void ObjectMapNode::extractObjects() {
   // 标记已处理
   last_processed_stamp_ = cloud_stamp;
 
-  // 查找 TF: cloud frame → map (缩短等待时间以加快响应)
+  // 查找 TF: cloud frame → map (用消息时间戳, 避免旋转重影)
   Eigen::Matrix4f tf_mat;
   try {
     auto tf_stamped = tf_buffer_->lookupTransform(
         target_frame_, cloud_msg->header.frame_id,
-        tf2::TimePointZero, tf2::durationFromSec(0.1));
+        cloud_msg->header.stamp, tf2::durationFromSec(0.05));
     Eigen::Isometry3d tf_eigen = tf2::transformToEigen(tf_stamped.transform);
     tf_mat = tf_eigen.matrix().cast<float>();
   } catch (const tf2::TransformException &ex) {
