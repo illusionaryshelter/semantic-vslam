@@ -1,3 +1,7 @@
+# Gemini agent
+.agents/
+AGENTS.md
+
 # Build artifacts
 build/
 install/
