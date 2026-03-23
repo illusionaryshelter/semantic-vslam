@@ -12,31 +12,25 @@
 #include "semantic_vslam/cuda_colorspace.hpp"
 
 #include <chrono>
-#include <set>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
 
 namespace semantic_vslam {
 
-// COCO 动态类别 ID (可能在场景中移动的物体)
-// person=0, bicycle=1, car=2, motorcycle=3, bus=5, train=6, truck=7,
+// COCO 类别查找表 — bool[80] 替代 std::set (每帧调用 300K+ 次, O(1) vs O(log n))
+// 动态类别: person=0, bicycle=1, car=2, motorcycle=3, bus=5, train=6, truck=7,
 // bird=14, cat=15, dog=16, horse=17, sheep=18, cow=19
-static const std::set<int> kDynamicClasses = {
-    0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19
-};
+static bool initDynamic() {
+  static bool t[80] = {};
+  for (int c : {0,1,2,3,5,6,7,14,15,16,17,18,19}) t[c] = true;
+  return true;
+}
+static bool kIsDynamic[80] = {};
+static const bool kDynInit_ = (initDynamic(), [] { for (int c : {0,1,2,3,5,6,7,14,15,16,17,18,19}) kIsDynamic[c] = true; return true; }());
 
-// 静态物体类别 (用于 3D 包围盒 — Masked Back-Projection)
-static const std::set<int> kStaticObjectClasses = {
-    13,  // bench
-    56,  // chair
-    57,  // couch
-    58,  // potted plant
-    59,  // bed
-    60,  // dining table
-    61,  // toilet
-    62,  // tv
-    72,  // refrigerator
-};
+// 静态物体类别 (用于 3D 包围盒)
+static bool kIsStaticObject[80] = {};
+static const bool kStaticInit_ = ([] { for (int c : {13,56,57,58,59,60,61,62,72}) kIsStaticObject[c] = true; return true; }());
 
 // COCO 类名 (用于 Marker 文字标签)
 static const char* kCocoNames[] = {
@@ -223,22 +217,37 @@ void SemanticCloudNode::syncCallback(
 
   auto t3 = std::chrono::steady_clock::now();
 
-  // 4. 转换为 ROS2 PointCloud2 消息并发布
-  sensor_msgs::msg::PointCloud2 pc2_msg;
-  pcl::toROSMsg(cloud, pc2_msg);
-  pc2_msg.header = rgb_msg->header;
-  cloud_pub_->publish(pc2_msg);
+  // 4. 转换为 ROS2 PointCloud2 消息并发布 (只保留有效点, 去掉 NaN)
+  {
+    pcl::PointCloud<pcl::PointXYZRGB> dense_cloud;
+    dense_cloud.reserve(cloud.size() / 2);  // 通常 50-70% 有效
+    for (const auto &pt : cloud.points) {
+      if (!std::isnan(pt.z)) {
+        dense_cloud.push_back(pt);
+      }
+    }
+    dense_cloud.width = dense_cloud.size();
+    dense_cloud.height = 1;
+    dense_cloud.is_dense = true;
 
-  // 5. 动态物体深度掩码: 将人/车/动物等动态类别区域的深度置零
+    sensor_msgs::msg::PointCloud2 pc2_msg;
+    pcl::toROSMsg(dense_cloud, pc2_msg);
+    pc2_msg.header = rgb_msg->header;
+    cloud_pub_->publish(pc2_msg);
+  }
+
+  // 5. 动态物体深度掩码: 单次扫描统计 + 记录位置, 避免双重全图遍历
   //    rtabmap 在深度=0 的区域不提特征 → 消除动态物体鬼影
-  //    安全机制: 如果剔除比例 >50%, 跳过掩码防止特征过少跟丢
-  cv::Mat filtered_depth = depth;  // 默认: 不拷贝, 直接用原始深度
+  cv::Mat filtered_depth = depth;
   int masked_pixels = 0;
   int valid_pixels = 0;
 
   if (!label_map.empty()) {
-    // 先统计: 动态区域占多少有效深度像素?
     const bool is_16u = (depth.type() == CV_16UC1);
+    // 收集动态像素坐标 (一次扫描, 无需第二次全图遍历)
+    std::vector<std::pair<int,int>> dynamic_coords;
+    dynamic_coords.reserve(1024);
+
     for (int v = 0; v < depth.rows; ++v) {
       const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
       const uint16_t *d16_row = is_16u ? depth.ptr<uint16_t>(v) : nullptr;
@@ -248,32 +257,24 @@ void SemanticCloudNode::syncCallback(
         if (z > 0.01f && z < 10.0f) {
           valid_pixels++;
           uint8_t lbl = lbl_row[u];
-          if (lbl > 0 && kDynamicClasses.count(lbl - 1)) {
-            masked_pixels++;
+          if (lbl > 0 && lbl <= 80 && kIsDynamic[lbl - 1]) {
+            dynamic_coords.emplace_back(v, u);
           }
         }
       }
     }
+    masked_pixels = static_cast<int>(dynamic_coords.size());
 
-    // 安全阈值: 动态区域占有效深度 <50% 才执行掩码
+    // 安全阈值: 动态区域 <50% 才执行掩码
     if (masked_pixels > 0 && valid_pixels > 0 &&
         masked_pixels < valid_pixels / 2) {
       filtered_depth = depth.clone();
-      for (int v = 0; v < filtered_depth.rows; ++v) {
-        const uint8_t *lbl_row = label_map.ptr<uint8_t>(v);
-        if (is_16u) {
-          uint16_t *d_row = filtered_depth.ptr<uint16_t>(v);
-          for (int u = 0; u < filtered_depth.cols; ++u) {
-            if (lbl_row[u] > 0 && kDynamicClasses.count(lbl_row[u] - 1))
-              d_row[u] = 0;
-          }
-        } else {
-          float *d_row = filtered_depth.ptr<float>(v);
-          for (int u = 0; u < filtered_depth.cols; ++u) {
-            if (lbl_row[u] > 0 && kDynamicClasses.count(lbl_row[u] - 1))
-              d_row[u] = 0.0f;
-          }
-        }
+      if (is_16u) {
+        for (auto [v, u] : dynamic_coords)
+          filtered_depth.at<uint16_t>(v, u) = 0;
+      } else {
+        for (auto [v, u] : dynamic_coords)
+          filtered_depth.at<float>(v, u) = 0.0f;
       }
     }
   }
@@ -281,7 +282,6 @@ void SemanticCloudNode::syncCallback(
   // 转发 RGB + 过滤后深度给 rtabmap
   rgb_pub_->publish(*rgb_msg);
   if (filtered_depth.data != depth.data) {
-    // 深度被过滤过 → 重新封装为 ROS 消息
     auto filt_msg = cv_bridge::CvImage(
         depth_msg->header, cv_depth->encoding, filtered_depth).toImageMsg();
     depth_pub_->publish(*filt_msg);
@@ -289,9 +289,11 @@ void SemanticCloudNode::syncCallback(
     depth_pub_->publish(*depth_msg);
   }
 
-  // 6. 发布语义标签图
-  auto label_ros = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
-  label_map_pub_->publish(*label_ros);
+  // 6. 发布语义标签图 (lazy: 无订阅者时跳过序列化)
+  if (label_map_pub_->get_subscription_count() > 0) {
+    auto label_ros = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
+    label_map_pub_->publish(*label_ros);
+  }
 
   // 7. Masked Back-Projection: YOLO mask + depth → 3D AABB (无需 PCL 聚类)
   //    直接在当前帧使用 YOLO 实例 mask + depth 反投影计算 3D 包围盒
@@ -411,7 +413,7 @@ void SemanticCloudNode::generateSemanticCloud(
       if (lbl > 0) {
         int cls = lbl - 1;
         // 动态物体 → NaN (不进入语义地图, 避免鬼影)
-        if (kDynamicClasses.count(cls)) {
+        if (cls < 80 && kIsDynamic[cls]) {
           pt.x = pt.y = pt.z = std::numeric_limits<float>::quiet_NaN();
           pt.r = pt.g = pt.b = 0;
           continue;
@@ -455,7 +457,7 @@ void SemanticCloudNode::computeObjectBoxes(
   std::vector<DetectedObject> detections;
 
   for (const auto &obj : objects) {
-    if (!kStaticObjectClasses.count(obj.label)) continue;
+    if (obj.label < 0 || obj.label >= 80 || !kIsStaticObject[obj.label]) continue;
 
     Eigen::Vector3f min_pt( 1e9f,  1e9f,  1e9f);
     Eigen::Vector3f max_pt(-1e9f, -1e9f, -1e9f);
