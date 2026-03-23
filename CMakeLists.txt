@@ -92,7 +92,8 @@ target_link_libraries(semantic_cloud_component
 )
 ament_target_dependencies(semantic_cloud_component
   rclcpp rclcpp_components
-  sensor_msgs cv_bridge message_filters image_transport pcl_conversions
+  sensor_msgs visualization_msgs cv_bridge message_filters image_transport pcl_conversions
+  tf2_ros tf2_geometry_msgs tf2_eigen
 )
 rclcpp_components_register_nodes(semantic_cloud_component
   "semantic_vslam::SemanticCloudNode"

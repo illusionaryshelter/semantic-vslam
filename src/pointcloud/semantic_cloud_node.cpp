@@ -14,6 +14,7 @@
 #include <chrono>
 #include <set>
 #include <pcl_conversions/pcl_conversions.h>
+#include <tf2_eigen/tf2_eigen.hpp>
 
 namespace semantic_vslam {
 
@@ -22,6 +23,36 @@ namespace semantic_vslam {
 // bird=14, cat=15, dog=16, horse=17, sheep=18, cow=19
 static const std::set<int> kDynamicClasses = {
     0, 1, 2, 3, 5, 6, 7, 14, 15, 16, 17, 18, 19
+};
+
+// 静态物体类别 (用于 3D 包围盒 — Masked Back-Projection)
+static const std::set<int> kStaticObjectClasses = {
+    13,  // bench
+    56,  // chair
+    57,  // couch
+    58,  // potted plant
+    59,  // bed
+    60,  // dining table
+    61,  // toilet
+    62,  // tv
+    72,  // refrigerator
+};
+
+// COCO 类名 (用于 Marker 文字标签)
+static const char* kCocoNames[] = {
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair dryer", "toothbrush"
 };
 
 SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
@@ -89,6 +120,14 @@ SemanticCloudNode::SemanticCloudNode(const rclcpp::NodeOptions &options)
   // 语义标签图发布 (CV_8UC1, 0=无语义, >0=class_id+1)
   label_map_pub_ =
       this->create_publisher<sensor_msgs::msg::Image>("/semantic_vslam/label_map", 5);
+
+  // ---- 物体 3D 包围盒 (Masked Back-Projection) ----
+  marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/semantic_vslam/object_markers", 1);
+
+  // TF2 (用于反投影到 map 坐标系)
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   RCLCPP_INFO(this->get_logger(),
               "SemanticCloudNode ready. Subscribed to: [%s] + [%s]",
@@ -184,11 +223,11 @@ void SemanticCloudNode::syncCallback(
 
   auto t3 = std::chrono::steady_clock::now();
 
-  // 4. 转换为 ROS2 PointCloud2 消息并发布 (unique_ptr → IPC 零拷贝)
-  auto pc2_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-  pcl::toROSMsg(cloud, *pc2_msg);
-  pc2_msg->header = rgb_msg->header;
-  cloud_pub_->publish(std::move(pc2_msg));
+  // 4. 转换为 ROS2 PointCloud2 消息并发布
+  sensor_msgs::msg::PointCloud2 pc2_msg;
+  pcl::toROSMsg(cloud, pc2_msg);
+  pc2_msg.header = rgb_msg->header;
+  cloud_pub_->publish(pc2_msg);
 
   // 5. 动态物体深度掩码: 将人/车/动物等动态类别区域的深度置零
   //    rtabmap 在深度=0 的区域不提特征 → 消除动态物体鬼影
@@ -250,10 +289,28 @@ void SemanticCloudNode::syncCallback(
     depth_pub_->publish(*depth_msg);
   }
 
-  // 6. 发布语义标签图 (unique_ptr → IPC 零拷贝)
-  auto label_msg = std::make_unique<sensor_msgs::msg::Image>(
-      *cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg());
-  label_map_pub_->publish(std::move(label_msg));
+  // 6. 发布语义标签图
+  auto label_ros = cv_bridge::CvImage(rgb_msg->header, "mono8", label_map).toImageMsg();
+  label_map_pub_->publish(*label_ros);
+
+  // 7. Masked Back-Projection: YOLO mask + depth → 3D AABB (无需 PCL 聚类)
+  //    直接在当前帧使用 YOLO 实例 mask + depth 反投影计算 3D 包围盒
+  Eigen::Matrix4f tf_mat = Eigen::Matrix4f::Identity();
+  bool has_tf = false;
+  try {
+    auto tf_stamped = tf_buffer_->lookupTransform(
+        target_frame_, rgb_msg->header.frame_id,
+        tf2::TimePointZero, tf2::durationFromSec(0.05));
+    Eigen::Isometry3d tf_eigen = tf2::transformToEigen(tf_stamped.transform);
+    tf_mat = tf_eigen.matrix().cast<float>();
+    has_tf = true;
+  } catch (const tf2::TransformException &) {
+    // TF 不可用时跳过物体检测 (不影响点云/地图)
+  }
+  if (has_tf) {
+    computeObjectBoxes(objects, depth, tf_mat);
+    publishMarkers();
+  }
 
   if (enable_profiling_) {
     auto t4 = std::chrono::steady_clock::now();
@@ -373,6 +430,256 @@ void SemanticCloudNode::generateSemanticCloud(
   }
 
   out_label_map = label_map;
+}
+
+// ---------------------------------------------------------------------------
+// computeObjectBoxes
+//
+// Masked Back-Projection: 对每个 YOLO 实例 mask 中的有效深度像素做反投影,
+// 计算 3D AABB 包围盒。以此替代 PCL 欧氏聚类 (消除 KdTree + 聚类开销).
+// ---------------------------------------------------------------------------
+void SemanticCloudNode::computeObjectBoxes(
+    const std::vector<Object> &objects,
+    const cv::Mat &depth,
+    const Eigen::Matrix4f &tf_mat) {
+
+  const float inv_fx = 1.0f / fx_;
+  const float inv_fy = 1.0f / fy_;
+  const bool is_16u = (depth.type() == CV_16UC1);
+
+  struct DetectedObject {
+    int class_id;
+    Eigen::Vector3f center;
+    Eigen::Vector3f size;
+  };
+  std::vector<DetectedObject> detections;
+
+  for (const auto &obj : objects) {
+    if (!kStaticObjectClasses.count(obj.label)) continue;
+
+    Eigen::Vector3f min_pt( 1e9f,  1e9f,  1e9f);
+    Eigen::Vector3f max_pt(-1e9f, -1e9f, -1e9f);
+    int count = 0;
+
+    // 只遍历 bbox 区域内的像素 (比全图遍历快很多)
+    const int y0 = std::max(0, obj.rect.y);
+    const int x0 = std::max(0, obj.rect.x);
+    const int y1 = std::min(depth.rows, obj.rect.y + obj.rect.height);
+    const int x1 = std::min(depth.cols, obj.rect.x + obj.rect.width);
+
+    for (int v = y0; v < y1; ++v) {
+      const int mv = v - obj.rect.y;  // mask 坐标
+      if (mv < 0 || mv >= obj.mask.rows) continue;
+      const uint8_t *mask_row = obj.mask.ptr<uint8_t>(mv);
+
+      for (int u = x0; u < x1; ++u) {
+        const int mu = u - obj.rect.x;
+        if (mu < 0 || mu >= obj.mask.cols) continue;
+        if (mask_row[mu] == 0) continue;  // 非物体像素
+
+        // 读取深度
+        float d = is_16u ? static_cast<float>(depth.at<uint16_t>(v, u)) * depth_scale_
+                         : depth.at<float>(v, u);
+        if (d < 0.1f || d > 5.0f) continue;
+
+        // 反投影 → camera 3D
+        float x = (static_cast<float>(u) - cx_) * d * inv_fx;
+        float y = (static_cast<float>(v) - cy_) * d * inv_fy;
+
+        // TF 变换 → map 坐标系
+        Eigen::Vector4f p_cam(x, y, d, 1.0f);
+        Eigen::Vector4f p_map = tf_mat * p_cam;
+
+        min_pt = min_pt.cwiseMin(p_map.head<3>());
+        max_pt = max_pt.cwiseMax(p_map.head<3>());
+        count++;
+      }
+    }
+
+    if (count < min_obj_points_) continue;
+
+    Eigen::Vector3f center = (min_pt + max_pt) * 0.5f;
+    Eigen::Vector3f size = max_pt - min_pt;
+
+    // 尺寸合理性检查
+    if (size.maxCoeff() < 0.05f || size.maxCoeff() > 3.0f) continue;
+    detections.push_back({obj.label, center, size});
+  }
+
+  // ---- 3D AABB IoU 数据关联 ----
+  auto computeIoU = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
+                       const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> float {
+    Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
+    Eigen::Vector3f min2 = c2 - s2 * 0.5f, max2 = c2 + s2 * 0.5f;
+    Eigen::Vector3f inter_min = min1.cwiseMax(min2);
+    Eigen::Vector3f inter_max = max1.cwiseMin(max2);
+    Eigen::Vector3f inter_size = (inter_max - inter_min).cwiseMax(0.0f);
+    float inter_vol = inter_size.x() * inter_size.y() * inter_size.z();
+    float vol1 = s1.x() * s1.y() * s1.z();
+    float vol2 = s2.x() * s2.y() * s2.z();
+    float union_vol = vol1 + vol2 - inter_vol;
+    return (union_vol > 1e-6f) ? (inter_vol / union_vol) : 0.0f;
+  };
+
+  auto isContainedIn = [](const Eigen::Vector3f &c1, const Eigen::Vector3f &s1,
+                          const Eigen::Vector3f &c2, const Eigen::Vector3f &s2) -> bool {
+    Eigen::Vector3f min1 = c1 - s1 * 0.5f, max1 = c1 + s1 * 0.5f;
+    Eigen::Vector3f min2 = c2 - s2 * 0.5f, max2 = c2 + s2 * 0.5f;
+    Eigen::Vector3f inter_min = min1.cwiseMax(min2);
+    Eigen::Vector3f inter_max = max1.cwiseMin(max2);
+    Eigen::Vector3f inter_size = (inter_max - inter_min).cwiseMax(0.0f);
+    float inter_vol = inter_size.x() * inter_size.y() * inter_size.z();
+    float vol1 = s1.x() * s1.y() * s1.z();
+    return (vol1 > 1e-6f) && (inter_vol / vol1 > 0.5f);
+  };
+
+  rclcpp::Time now_time = this->now();
+
+  for (auto &det : detections) {
+    int best_idx = -1;
+    float best_iou = 0.0f;
+    for (int i = 0; i < static_cast<int>(object_map_.size()); ++i) {
+      auto &obj = object_map_[i];
+      if (obj.class_id != det.class_id) continue;
+      float iou = computeIoU(obj.center, obj.size, det.center, det.size);
+      bool contained = isContainedIn(det.center, det.size, obj.center, obj.size) ||
+                       isContainedIn(obj.center, obj.size, det.center, det.size);
+      float score = contained ? std::max(iou, 0.2f) : iou;
+      if (score > best_iou) {
+        best_iou = score;
+        best_idx = i;
+      }
+    }
+
+    if (best_idx >= 0 && best_iou > 0.15f) {
+      auto &obj = object_map_[best_idx];
+      float w = 1.0f / (obj.observe_count + 1);
+      obj.center = obj.center * (1.0f - w) + det.center * w;
+      obj.size = obj.size * (1.0f - w) + det.size * w;
+      obj.observe_count++;
+      obj.last_seen = now_time;
+    } else if (static_cast<int>(object_map_.size()) < max_objects_) {
+      object_map_.push_back({det.class_id, det.center, det.size, 1, now_time});
+    }
+  }
+
+  // 合并冗余物体
+  for (int i = 0; i < static_cast<int>(object_map_.size()); ++i) {
+    for (int j = i + 1; j < static_cast<int>(object_map_.size()); ) {
+      if (object_map_[i].class_id != object_map_[j].class_id) { ++j; continue; }
+      float iou = computeIoU(object_map_[i].center, object_map_[i].size,
+                             object_map_[j].center, object_map_[j].size);
+      bool contained = isContainedIn(object_map_[j].center, object_map_[j].size,
+                                     object_map_[i].center, object_map_[i].size) ||
+                       isContainedIn(object_map_[i].center, object_map_[i].size,
+                                     object_map_[j].center, object_map_[j].size);
+      if (iou > 0.1f || contained) {
+        auto &keep = (object_map_[i].observe_count >= object_map_[j].observe_count)
+                         ? object_map_[i] : object_map_[j];
+        auto &drop = (object_map_[i].observe_count >= object_map_[j].observe_count)
+                         ? object_map_[j] : object_map_[i];
+        float w = static_cast<float>(drop.observe_count) /
+                  (keep.observe_count + drop.observe_count);
+        keep.center = keep.center * (1.0f - w) + drop.center * w;
+        keep.size = keep.size.cwiseMax(drop.size);
+        keep.observe_count += drop.observe_count;
+        if (drop.last_seen > keep.last_seen) keep.last_seen = drop.last_seen;
+        object_map_.erase(object_map_.begin() + j);
+      } else {
+        ++j;
+      }
+    }
+  }
+
+  // 观测计数衰减 + 清理
+  for (auto &obj : object_map_) {
+    if ((now_time - obj.last_seen).seconds() > 5.0 && obj.observe_count > 0) {
+      obj.observe_count--;
+    }
+  }
+  object_map_.erase(
+      std::remove_if(object_map_.begin(), object_map_.end(),
+          [&](const ObjectInstance &obj) {
+            return (now_time - obj.last_seen).seconds() > 15.0 ||
+                   obj.observe_count <= 0;
+          }),
+      object_map_.end());
+}
+
+// ---------------------------------------------------------------------------
+// publishMarkers
+// ---------------------------------------------------------------------------
+void SemanticCloudNode::publishMarkers() {
+  visualization_msgs::msg::MarkerArray marker_array;
+  auto stamp = this->now();
+
+  // 先清除旧 markers
+  visualization_msgs::msg::Marker delete_marker;
+  delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+  delete_marker.header.stamp = stamp;
+  delete_marker.header.frame_id = target_frame_;
+  marker_array.markers.push_back(delete_marker);
+
+  int id = 0;
+  for (const auto &obj : object_map_) {
+    if (obj.observe_count < 1) continue;
+
+    // 半透明立方体
+    visualization_msgs::msg::Marker cube;
+    cube.header.stamp = stamp;
+    cube.header.frame_id = target_frame_;
+    cube.ns = "object_boxes";
+    cube.id = id;
+    cube.type = visualization_msgs::msg::Marker::CUBE;
+    cube.action = visualization_msgs::msg::Marker::ADD;
+    cube.pose.position.x = obj.center.x();
+    cube.pose.position.y = obj.center.y();
+    cube.pose.position.z = obj.center.z();
+    cube.pose.orientation.w = 1.0;
+    cube.scale.x = std::max(obj.size.x(), 0.05f);
+    cube.scale.y = std::max(obj.size.y(), 0.05f);
+    cube.scale.z = std::max(obj.size.z(), 0.05f);
+
+    if (obj.class_id >= 0 && obj.class_id < 80) {
+      cube.color.r = kSemanticColors[obj.class_id][0] / 255.0f;
+      cube.color.g = kSemanticColors[obj.class_id][1] / 255.0f;
+      cube.color.b = kSemanticColors[obj.class_id][2] / 255.0f;
+    } else {
+      cube.color.r = 1.0f; cube.color.g = 1.0f; cube.color.b = 0.0f;
+    }
+    cube.color.a = std::min(0.3f + obj.observe_count * 0.04f, 0.7f);
+    cube.lifetime = rclcpp::Duration(0, 0);
+    marker_array.markers.push_back(cube);
+
+    // 文字标签
+    visualization_msgs::msg::Marker text;
+    text.header = cube.header;
+    text.ns = "object_labels";
+    text.id = id;
+    text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    text.action = visualization_msgs::msg::Marker::ADD;
+    text.pose.position.x = obj.center.x();
+    text.pose.position.y = obj.center.y();
+    text.pose.position.z = obj.center.z() + obj.size.z() * 0.5f + 0.1f;
+    text.pose.orientation.w = 1.0;
+    text.scale.z = 0.12;
+    text.color.r = 1.0f; text.color.g = 1.0f;
+    text.color.b = 1.0f; text.color.a = 1.0f;
+
+    const char *name = (obj.class_id >= 0 && obj.class_id < 80)
+                           ? kCocoNames[obj.class_id] : "unknown";
+    text.text = std::string(name) + " (x" +
+                std::to_string(obj.observe_count) + ")";
+    text.lifetime = rclcpp::Duration(0, 0);
+    marker_array.markers.push_back(text);
+
+    id++;
+  }
+
+  marker_pub_->publish(marker_array);
+
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+      "Object map: %zu objects tracked", object_map_.size());
 }
 
 } // namespace semantic_vslam

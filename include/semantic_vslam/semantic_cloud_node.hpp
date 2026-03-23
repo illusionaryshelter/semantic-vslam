@@ -4,10 +4,10 @@
  * semantic_cloud_node.hpp
  *
  * ROS2 节点: 订阅 Astra Pro 的 RGB + Depth 图像，利用 YOLOv8-seg
- * 推理生成语义点云。
+ * 推理生成语义点云 + 物体级 3D 包围盒。
  *
- * 使用 pcl::PointXYZRGBL（含 x, y, z, rgb, label 字段），
- * 确保下游（如 RTAB-Map 或任何点云消费者）可直接读取每个点的语义标签。
+ * 物体检测通过 Masked Back-Projection 实现:
+ *   YOLO 实例 mask + depth 反投影 → 3D AABB (无需 PCL 聚类)
  */
 
 #include <cv_bridge/cv_bridge.h>
@@ -18,6 +18,11 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <Eigen/Core>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -26,10 +31,20 @@
 #include "semantic_vslam/yolo_inference.hpp"
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace semantic_vslam {
+
+// 物体实例 (跨帧跟踪)
+struct ObjectInstance {
+  int class_id;                  // COCO 类别 ID
+  Eigen::Vector3f center;        // 中心坐标 (map 坐标系)
+  Eigen::Vector3f size;          // 长宽高 (m)
+  int observe_count;             // 累积观测次数
+  rclcpp::Time last_seen;        // 最后观测时间
+};
 
 // ---------------------------------------------------------------------------
 // SemanticCloudNode
@@ -54,6 +69,14 @@ private:
                              pcl::PointCloud<pcl::PointXYZRGB> &cloud,
                              cv::Mat &out_label_map);
 
+  // Masked Back-Projection: YOLO mask + depth → 3D AABB
+  void computeObjectBoxes(const std::vector<Object> &objects,
+                          const cv::Mat &depth,
+                          const Eigen::Matrix4f &tf_mat);
+
+  // 发布 MarkerArray
+  void publishMarkers();
+
   // YOLO
   std::unique_ptr<YoloInference> yolo_;
 
@@ -75,6 +98,19 @@ private:
   // 用于转发给 RTAB-Map 的原始 image 发布
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr rgb_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_pub_;
+
+  // 物体 Marker 发布
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+
+  // TF2 (用于 masked back-projection → map 坐标系)
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+  // 物体跟踪地图
+  std::vector<ObjectInstance> object_map_;
+  int max_objects_ = 50;
+  int min_obj_points_ = 50;  // 物体最少 3D 点数
+  std::string target_frame_ = "map";
 
   // 相机内参
   bool has_cam_info_ = false;

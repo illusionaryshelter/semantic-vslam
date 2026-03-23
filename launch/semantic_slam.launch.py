@@ -16,7 +16,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node, ComposableNodeContainer, LoadComposableNodes
+from launch_ros.actions import Node
 from launch_ros.descriptions import ComposableNode
 from launch_ros.substitutions import FindPackageShare
 from launch.launch_description_sources import AnyLaunchDescriptionSource
@@ -171,75 +171,37 @@ def generate_launch_description():
         ),
 
 
-
         # ============================================================
-        # 4. 快进程: IPC 容器 (semantic_cloud + object_map)
+        # 4. 语义点云 + 物体检测 (独立进程)
         #
-        # 高频高带宽节点共享进程, 零拷贝传递 9.4MB PointCloud2
-        # 单线程: 只有 2 个节点, cloud 回调轻量 (store latest)
+        # Masked Back-Projection: YOLO mask + depth → 3D AABB
+        # 无需 PCL 聚类, 物体检测 inline 在点云生成节点内
         # ============================================================
-        ComposableNodeContainer(
-            name='semantic_container',
-            namespace='',
-            package='rclcpp_components',
-            executable='component_container_mt',  # 多线程: VoxelGrid 已隔离, 无竞争风险
+        Node(
+            package='semantic_vslam',
+            executable='semantic_cloud_node',
+            name='semantic_cloud_node',
+            parameters=[
+                PathJoinSubstitution([
+                    FindPackageShare('semantic_vslam'),
+                    'config', 'params.yaml'
+                ]),
+                {
+                'engine_path':    LaunchConfiguration('engine_path'),
+                'rgb_topic':      LaunchConfiguration('rgb_topic'),
+                'depth_topic':    LaunchConfiguration('depth_topic'),
+                'cam_info_topic': LaunchConfiguration('cam_info_topic'),
+                'conf_thresh':    LaunchConfiguration('conf_thresh'),
+                'depth_scale':    0.001,
+                },
+            ],
             output='screen',
         ),
 
-        # ---- 加载: semantic_cloud_node ----
-        LoadComposableNodes(
-            target_container='semantic_container',
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='semantic_vslam',
-                    plugin='semantic_vslam::SemanticCloudNode',
-                    name='semantic_cloud_node',
-                    parameters=[
-                        PathJoinSubstitution([
-                            FindPackageShare('semantic_vslam'),
-                            'config', 'params.yaml'
-                        ]),
-                        {
-                        'engine_path':    LaunchConfiguration('engine_path'),
-                        'rgb_topic':      LaunchConfiguration('rgb_topic'),
-                        'depth_topic':    LaunchConfiguration('depth_topic'),
-                        'cam_info_topic': LaunchConfiguration('cam_info_topic'),
-                        'conf_thresh':    LaunchConfiguration('conf_thresh'),
-                        'depth_scale':    0.001,
-                        },
-                    ],
-                    extra_arguments=[
-                        {'use_intra_process_comms': True},
-                    ],
-                ),
-            ],
-        ),
-
-        # ---- 加载: object_map_node ----
-        LoadComposableNodes(
-            target_container='semantic_container',
-            composable_node_descriptions=[
-                ComposableNode(
-                    package='semantic_vslam',
-                    plugin='semantic_vslam::ObjectMapNode',
-                    name='object_map_node',
-                    parameters=[
-                        PathJoinSubstitution([
-                            FindPackageShare('semantic_vslam'),
-                            'config', 'params.yaml'
-                        ]),
-                    ],
-                    extra_arguments=[
-                        {'use_intra_process_comms': True},
-                    ],
-                ),
-            ],
-        ),
-
         # ============================================================
-        # 5. 慢进程: 语义地图累积 (独立进程)
+        # 5. 语义地图累积 (独立进程)
         #
-        # VoxelGrid 700ms @ 1Hz — 内存密集, 物理隔离避免
+        # VoxelGrid 700ms @ 1Hz — 内存密集, 独立进程避免
         # 与 YOLO 推理争夺 L2 cache
         # ============================================================
         Node(
@@ -262,4 +224,5 @@ def generate_launch_description():
             output='screen',
         ),
     ])
+
 
