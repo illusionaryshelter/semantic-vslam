@@ -2,7 +2,9 @@
 
 > **基于 YOLOv8-seg + RTAB-Map 的实时语义视觉 SLAM 系统**
 >
-> 目标硬件: NVIDIA Jetson Orin Nano 8GB | C++ / CUDA | ROS 2 Humble
+> 分支: `discrete-gpu` (独显台式机 / PCIe GPU) | C++ / CUDA | ROS 2 Humble
+>
+> ⚠️ **Jetson UMA 零拷贝版本请切换到 [`main`](../../tree/main) 分支**
 
 将 YOLOv8 实例分割与 RTAB-Map 视觉 SLAM 融合，在 RGB-D 输入上实时生成**语义着色 3D 点云地图**、**2D 占据栅格地图**和**物体级 3D 包围盒**，为下游导航和场景理解提供语义感知能力。
 
@@ -50,38 +52,37 @@
 
 ##  性能
 
-在 **Jetson Orin Nano 8GB** + **Astra Pro 640×480@30fps** 上实测:
+在 **Jetson Orin Nano 8GB** + **Astra Pro 640×480@30fps** 上实测 (discrete-gpu 分支在 Jetson 上验证):
 
 ### 逐帧耗时 (semantic_cloud_node)
 
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
-| 色彩转换 (cvt) | **~1 ms** | CUDA `gpuSwapRB` (零拷贝) |
-| YOLO 推理 | **~12-19 ms** | TensorRT FP16 + 融合预处理 kernel |
+| 色彩转换 (cvt) | **~1 ms** | CUDA `gpuSwapRB` |
+| YOLO 推理 | **~14-26 ms** | TensorRT FP16 + 融合预处理 kernel |
 | 点云生成 | **~6-8 ms** | 深度→3D 投影 + 语义着色 + 动态过滤 |
-| 发布 | **~10-15 ms** | ROS2 序列化 + DDS |
-| **总计** | **~29-40 ms** | **~25-34 FPS** |
+| 发布 | **~9-22 ms** | ROS2 序列化 + DDS |
+| **总计** | **~32-57 ms** | **~17-31 FPS** |
 
 ### 地图累积耗时 (semantic_map_node)
 
 | 阶段 | 耗时 | 说明 |
 |---|---|---|
-| CUDA VoxelGrid | **~25-35 ms** | 增量式: global_map + new_frame → voxelize |
+| CUDA VoxelGrid | **~35-60 ms** | 增量式: global_map + new_frame → voxelize |
 | 2D 栅格投影 | **~1 ms** | 3D → OccupancyGrid |
-| **总计** | **~30-40 ms** | 增量式无需 merge 开销 |
+| **总计** | **~37-66 ms** | 增量式无需 merge 开销 |
 
 ### GPU 优化清单
 
 | 优化 | 文件 | 说明 |
 |---|---|---|
-| 零拷贝内存 | `yolo_inference.cpp` | `cudaHostAllocMapped` 消除 CPU↔GPU 拷贝 |
+| `cudaMalloc` + `cudaMemcpy` | `yolo_inference.cpp` | 独显 PCIe: 显式 H2D/D2H 拷贝 |
 | 融合预处理 Kernel | `cuda_preprocess.cu` | resize + BGR→RGB + normalize + HWC→CHW 单次 kernel |
 | Identity 快速路径 | `cuda_preprocess.cu` | 640×480→640×640 scale=1.0 跳过双线性插值 |
 | CUDA 色彩转换 | `cuda_colorspace.cu` | GPU RGB↔BGR / YUYV→BGR, <1ms |
 | GPU 批量掩码解码 | `cuda_preprocess.cu` | 所有目标掩码并行 dot-product + sigmoid |
 | **CUDA VoxelGrid** | `cuda_voxel_grid.cu` | `thrust::sort_by_key` 替代 PCL VoxelGrid |
-| **UMA 零拷贝** | `cuda_voxel_grid.cu` | `cudaMallocManaged` 消除 H2D/D2H (Jetson UMA) |
-| **持久显存池** | `cuda_voxel_grid.cu` | `GPUPool` 一次分配跨调用复用, 避免反复 cudaMalloc/Free |
+| **持久 GPU 池** | `cuda_voxel_grid.cu` | `GPUPool` (全 `cudaMalloc`) 一次分配跨调用复用 |
 | **uint64 空间哈希** | `cuda_voxel_grid.cu` | 21-bit/轴 bit-packing, 无碰撞, ±20km 范围 |
 | **增量式体素化** | `cuda_voxel_grid_wrapper.cpp` | `CudaIncrementalVoxelGrid` 永久全局地图 |
 
@@ -89,7 +90,7 @@
 
 | 模块 | 频率 |
 |---|---|
-| 语义点云 (semantic_cloud_node) | **~25-34 FPS** |
+| 语义点云 (semantic_cloud_node) | **~17-31 FPS** |
 | 视觉里程计 (rgbd_odometry) | ~5–7 FPS |
 | SLAM (rtabmap) | ~2 Hz |
 | 语义地图发布 (semantic_map_node) | 1 Hz |
@@ -262,7 +263,7 @@ ANTI/
 │   └── rtabmap_slam_node.hpp               # RTAB-Map 封装 (legacy)
 └── src/
     ├── model_inference/
-    │   ├── yolo_inference.cpp              # TensorRT 推理 (零拷贝 + 动态批次)
+    │   ├── yolo_inference.cpp              # TensorRT 推理 (cudaMalloc + cudaMemcpy)
     │   ├── cuda_preprocess.cu              # 融合预处理 + 掩码解码 kernel
     │   ├── cuda_colorspace.cu              # RGB↔BGR / YUYV→BGR kernel
     │   ├── test_yolo_inference.cpp         # YOLO 静态图像测试
@@ -306,13 +307,17 @@ key = (vx + OFFSET) << 42 | (vy + OFFSET) << 21 | (vz + OFFSET)
 - 无哈希碰撞 (排序后相同 voxel 的点必然相邻)
 - 对比 Nießner XOR Hash: `(x*73856093) ⊕ (y*19349669) ⊕ (z*83492791)` 有碰撞, 不适用于 sort-based 算法
 
-### Jetson UMA 优化
+### 独显 (PCIe) 内存策略
 
-| 优化 | 效果 |
-|---|---|
-| `cudaMallocManaged` | CPU/GPU 共享物理内存, 消除 H2D/D2H 拷贝 |
-| 持久 `GPUPool` | 一次 alloc, 跨调用复用 (1.5x 增长策略) |
-| 直写输出 | gather kernel 直接写到调用者缓冲区, 无中间 memcpy |
+| 组件 | 策略 | 说明 |
+|---|---|---|
+| GPUPool 中间缓冲 | `cudaMalloc` | 纯 device memory, GPU L2 cached |
+| I/O 缓冲 (input/output) | `cudaMalloc` + `cudaMemcpy` | host→device H2D, device→host D2H |
+| 持久分配 | 1.5x 增长策略 | 一次 alloc, 跨调用复用 |
+| TRT 推理缓冲 | `malloc` + `cudaMalloc` | host/device 分离, 显式 `cudaMemcpy` |
+
+> 💡 **与 `main` 分支的区别**: `main` 使用 `cudaHostAllocMapped` (Jetson UMA 真零拷贝),
+> 此分支使用 `cudaMalloc` + 显式 `cudaMemcpy` (适用于 PCIe 独显)。
 
 ### 增量式全局地图
 
