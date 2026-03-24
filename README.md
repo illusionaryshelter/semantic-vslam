@@ -4,7 +4,7 @@
 >
 > 目标硬件: NVIDIA Jetson Orin Nano 8GB | C++ / CUDA | ROS 2 Humble
 >
-> ⚠️ **非 Jetson版本请切换到 [`discrete_gpu`](../../tree/discrete_gpu) 分支**
+> ⚠️ **非 Jetson版本请切换到 [`discrete-gpu`](../../tree/discrete-gpu) 分支**
 
 将 YOLOv8 实例分割与 RTAB-Map 视觉 SLAM 融合，在 RGB-D 输入上实时生成**语义着色 3D 点云地图**、**2D 占据栅格地图**和**物体级 3D 包围盒**，为下游导航和场景理解提供语义感知能力。
 
