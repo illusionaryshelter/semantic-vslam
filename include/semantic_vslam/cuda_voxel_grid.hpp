@@ -6,9 +6,10 @@
  * 架构: .cu (CUDA kernel, 无 PCL) + .cpp (PCL 封装)
  * 颜色策略: first-point (语义颜色不能平均)
  *
- * Jetson 优化:
- *   - cudaMallocManaged: UMA 零拷贝 (CPU/GPU 共享物理内存)
- *   - 持久显存池: 避免反复 cudaMalloc/Free
+ * 内存策略 (Jetson UMA):
+ *   - GPUPool 中间缓冲区: cudaMalloc (纯 device, GPU L2 cached)
+ *   - I/O 缓冲区: cudaHostAllocMapped (pinned uncached = 真零拷贝)
+ *   - 持久分配: 一次分配跨调用复用
  */
 
 #pragma once
@@ -26,14 +27,12 @@ struct VoxelPoint {
 /**
  * CUDA 底层实现 (纯 C 接口, 在 .cu 中定义)
  *
- * @param input       输入点数组 (可以是 managed 或普通 host 指针)
+ * @param input       输入点数组 (mapped 或 device 指针)
  * @param num_points  输入点数
- * @param h_output    输出缓冲区 (可以是 managed 或普通 host 指针)
+ * @param h_output    输出缓冲区 (mapped 或 device 指针)
  * @param max_output  输出缓冲区最大容量
  * @param voxel_size  体素尺寸 (m)
  * @return 输出点数
- *
- * 注: bounding box 参数保留兼容性但不再使用 (uint64_t bit-packing 不需要)
  */
 int cudaVoxelGridFilterRaw(
     const VoxelPoint* input, int num_points,
@@ -44,15 +43,22 @@ int cudaVoxelGridFilterRaw(
     float min_z = 0, float max_z = 0);
 
 /**
- * Managed 内存分配/释放 (Jetson UMA 零拷贝)
+ * 真零拷贝内存分配 (cudaHostAllocMapped)
  *
- * 分配的内存可同时被 CPU 和 GPU 访问, 无需 H2D/D2H 拷贝
- * 用法:
- *   VoxelPoint* buf = cudaVoxelGridAllocManaged(N);
- *   // CPU 直接写入 buf[i] = {x, y, z, r, g, b, 0};
- *   // GPU kernel 直接读取 buf[i]
- *   cudaVoxelGridFreeManaged(buf);
+ * Jetson UMA: pinned + uncached → CPU 写直达物理内存, GPU DMA 直读
+ * 无 cache flush/invalidation 开销 (对比 cudaMallocManaged)
+ *
+ * @param max_points  最大点数
+ * @param host_ptr    [out] CPU 端指针 (用于填充/读取)
+ * @param dev_ptr     [out] GPU 端指针 (传给 CUDA kernel)
+ * @return true=成功
  */
+bool cudaVoxelGridAllocZeroCopy(int max_points,
+                                VoxelPoint** host_ptr,
+                                VoxelPoint** dev_ptr);
+void cudaVoxelGridFreeZeroCopy(VoxelPoint* host_ptr);
+
+// ---- 兼容旧 API (deprecated, 保留用于单元测试) ----
 VoxelPoint* cudaVoxelGridAllocManaged(int max_points);
 void cudaVoxelGridFreeManaged(VoxelPoint* ptr);
 
@@ -66,9 +72,9 @@ void cudaVoxelGridFreeManaged(VoxelPoint* ptr);
 namespace semantic_vslam {
 
 /**
- * CUDA VoxelGrid 下采样 (PCL 接口, 单帧)
+ * CUDA VoxelGrid 下采样 (PCL 接口)
  *
- * 内部使用 managed memory + 持久显存池, Jetson UMA 上零拷贝
+ * 内部使用 cudaHostAllocMapped 真零拷贝 + cudaMalloc 持久 GPU 池
  */
 void cudaVoxelGridFilter(
     const pcl::PointCloud<pcl::PointXYZRGB>& input,
@@ -86,27 +92,12 @@ void cudaVoxelGridFilter(
  *   - 增量式:   55K pts voxel(~25ms), 地图永久保留
  *
  * 颜色策略: first-point (已有体素的颜色不会被新帧覆盖)
- *
- * 用法:
- *   CudaIncrementalVoxelGrid grid(0.02f);
- *   grid.addCloud(new_frame);           // 每帧调用
- *   const auto& map = grid.getMap();    // 获取全局地图
- *   grid.clear();                       // 重置 (可选)
  */
 class CudaIncrementalVoxelGrid {
 public:
   explicit CudaIncrementalVoxelGrid(float voxel_size);
 
-  /**
-   * 将新帧融合到全局地图
-   *
-   * 内部流程:
-   *   1. 拼接 global_map_ + new_cloud (managed memory, 无 150 帧 merge 开销)
-   *   2. CUDA sort_by_key + dedup (uint64_t 空间哈希, 无碰撞)
-   *   3. 结果覆盖 global_map_
-   *
-   * 复杂度: O((M+N) log(M+N)), M=全局地图点数, N=新帧点数
-   */
+  /// 将新帧融合到全局地图
   void addCloud(const pcl::PointCloud<pcl::PointXYZRGB>& new_cloud);
 
   /// 获取当前全局地图 (只读引用)

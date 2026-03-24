@@ -8,10 +8,14 @@
  *
  * 空间哈希: uint64_t bit-packing (21位/轴, 无碰撞, ±20km @ 0.02m)
  *
- * Jetson 优化:
- *   1. cudaMallocManaged (UMA 零拷贝: CPU/GPU 共享物理内存, 无 H2D/D2H)
- *   2. 持久显存池 (GPUPool: 一次分配, 跨调用复用, 避免反复 cudaMalloc/Free)
- *   3. thrust::device_ptr 包装 managed 指针 (兼容 Thrust 算法)
+ * 内存策略 (Jetson UMA):
+ *   1. GPUPool 中间缓冲区: cudaMalloc (纯 device memory, GPU L2 cache 正常)
+ *      - voxel_keys, point_idx, boundary, prefix 仅 GPU 读写
+ *      - CPU 仅读 prefix[N-1] → cudaMemcpy D2H 4 字节
+ *   2. I/O 缓冲区: cudaHostAllocMapped (pinned + uncached = 真零拷贝)
+ *      - CPU 写入直达物理内存, GPU DMA 直读, 无 cache flush 开销
+ *      - 对比 cudaMallocManaged: 后者 CPU cacheable, 需要 cache flush/invalidation
+ *   3. 持久分配: 一次分配跨调用复用, 1.5x 增长, 避免反复 alloc/free
  *
  * 注意: 此文件仅包含 CUDA Runtime / Thrust, 不包含 PCL / Eigen
  *       PCL 封装在 cuda_voxel_grid_wrapper.cpp 中
@@ -40,30 +44,29 @@ static constexpr uint64_t VOXEL_BITS = 21;
 static constexpr uint64_t VOXEL_OFFSET = (1ULL << (VOXEL_BITS - 1));
 
 // ============================================================================
-// 持久显存池: 一次分配, 跨调用复用
+// 持久 GPU 内存池: cudaMalloc (纯 device memory)
 //
-// 避免每帧 5 次 cudaMalloc + 5 次 cudaFree (~2-5ms 系统调用开销)
-// 使用 cudaMallocManaged: Jetson UMA 上 CPU/GPU 共享物理内存, 真正零拷贝
+// 中间缓冲区仅 GPU 读写: sort, scan, boundary, gather
+// 纯 device memory 保证 GPU L2 cache 正常工作
+// (对比 cudaMallocManaged: GPU 也走 cache coherency protocol → 额外开销)
+// (对比 cudaHostAllocMapped: GPU cache 被 bypass → sort 随机访问极慢)
 // ============================================================================
 struct GPUPool {
-  uint64_t*   voxel_keys = nullptr;  // Voxel hash keys (排序用)
-  uint32_t*   point_idx  = nullptr;  // 原始点索引 (随 key 一起排序)
+  uint64_t*   voxel_keys = nullptr;  // Voxel hash keys (sort 随机访问, 必须 device)
+  uint32_t*   point_idx  = nullptr;  // 原始点索引 (随 key 一起 sort, 必须 device)
   uint32_t*   boundary   = nullptr;  // Voxel 边界标记
   uint32_t*   prefix     = nullptr;  // Inclusive scan 前缀和
-  int capacity = 0;                  // 当前分配的最大点数
+  int capacity = 0;
 
-  // 确保容量足够, 仅在 N > capacity 时重新分配
   void ensure(int N) {
     if (N <= capacity) return;
-
-    // 增长策略: 至少 1.5x, 避免频繁 realloc
     int new_cap = std::max(N, static_cast<int>(capacity * 1.5));
     free_all();
 
-    cudaMallocManaged(&voxel_keys, new_cap * sizeof(uint64_t));
-    cudaMallocManaged(&point_idx,  new_cap * sizeof(uint32_t));
-    cudaMallocManaged(&boundary,   new_cap * sizeof(uint32_t));
-    cudaMallocManaged(&prefix,     new_cap * sizeof(uint32_t));
+    cudaMalloc(&voxel_keys, new_cap * sizeof(uint64_t));
+    cudaMalloc(&point_idx,  new_cap * sizeof(uint32_t));
+    cudaMalloc(&boundary,   new_cap * sizeof(uint32_t));
+    cudaMalloc(&prefix,     new_cap * sizeof(uint32_t));
     capacity = new_cap;
   }
 
@@ -78,7 +81,6 @@ struct GPUPool {
   ~GPUPool() { free_all(); }
 };
 
-// 全局持久池 (进程生命周期, 只分配一次)
 static GPUPool g_pool;
 
 // ---- Kernel 1: 计算每个点的 voxel key (uint64_t bit-packing) ----
@@ -142,10 +144,12 @@ __global__ void gatherFirstPointKernel(
 }
 
 // ============================================================================
-// 底层接口: 使用 managed 内存指针 (Jetson UMA 零拷贝)
+// 底层接口
 //
-// 调用者通过 cudaVoxelGridGetManagedBuffers() 获取 managed 内存,
-// 直接写入数据, 无 H2D 拷贝. 输出同理, 无 D2H 拷贝.
+// input/h_output 可以是:
+//   - cudaHostAllocMapped 指针 (真零拷贝, wrapper 使用)
+//   - 普通 host 指针 (单元测试, 需要 H2D/D2H → 由调用者自行处理)
+//   - device 指针 (直接 GPU 使用)
 // ============================================================================
 int cudaVoxelGridFilterRaw(
     const VoxelPoint* input, int N,
@@ -159,24 +163,23 @@ int cudaVoxelGridFilterRaw(
 
   const float inv_voxel = 1.0f / voxel_size;
 
-  // 确保持久池容量足够
   g_pool.ensure(N);
 
-  // ---- 计算 voxel key ----
   const int BLOCK = 256;
   const int GRID = (N + BLOCK - 1) / BLOCK;
 
+  // ---- 计算 voxel key (input: mapped/device, output: device) ----
   calcVoxelIndexKernel<<<GRID, BLOCK>>>(
       input, N, inv_voxel,
       g_pool.voxel_keys, g_pool.point_idx);
   cudaDeviceSynchronize();
 
-  // ---- Thrust sort_by_key (通过 device_ptr 包装 managed 指针) ----
+  // ---- Thrust sort (纯 device memory, GPU L2 cached) ----
   thrust::device_ptr<uint64_t> keys_begin(g_pool.voxel_keys);
   thrust::device_ptr<uint32_t> vals_begin(g_pool.point_idx);
   thrust::sort_by_key(keys_begin, keys_begin + N, vals_begin);
 
-  // ---- 标记边界 + inclusive scan ----
+  // ---- 标记边界 + inclusive scan (纯 device memory) ----
   markBoundaryKernel<<<GRID, BLOCK>>>(
       g_pool.voxel_keys, N, g_pool.boundary);
   cudaDeviceSynchronize();
@@ -185,15 +188,16 @@ int cudaVoxelGridFilterRaw(
   thrust::device_ptr<uint32_t> pfx_begin(g_pool.prefix);
   thrust::inclusive_scan(bnd_begin, bnd_begin + N, pfx_begin);
 
-  // 同步后读取 managed memory 中的 num_unique (Jetson UMA 直接读)
-  cudaDeviceSynchronize();
-  uint32_t num_unique = g_pool.prefix[N - 1];
+  // ---- 读取 num_unique: cudaMemcpy D2H 4 字节 (prefix 是 device memory) ----
+  uint32_t num_unique = 0;
+  cudaMemcpy(&num_unique, g_pool.prefix + N - 1,
+             sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
   if (num_unique == 0 || static_cast<int>(num_unique) > max_output) {
     return 0;
   }
 
-  // ---- 提取每个 voxel 第一个点 (直接写到输出缓冲区, 无中间拷贝) ----
+  // ---- 提取每个 voxel 第一个点 (直接写到输出缓冲区) ----
   gatherFirstPointKernel<<<GRID, BLOCK>>>(
       input, g_pool.point_idx, g_pool.boundary, g_pool.prefix,
       N, h_output);
@@ -203,11 +207,46 @@ int cudaVoxelGridFilterRaw(
 }
 
 // ============================================================================
-// Managed 内存分配/释放接口 (供 wrapper 使用)
+// Zero-copy 内存分配/释放 (cudaHostAllocMapped)
 //
-// Jetson UMA: cudaMallocManaged 分配的内存 CPU/GPU 共享物理页面
-// 调用者可直接用 CPU 写入 VoxelPoint 数据, GPU 内核直接读取, 零拷贝
+// Jetson UMA 真零拷贝:
+//   CPU 写入 → 直达物理内存 (uncached, 无 cache flush)
+//   GPU 读取 → DMA 从物理内存直读 (无 cache coherency 开销)
+//
+// 返回两个指针:
+//   host_ptr: CPU 端地址 (用于填充/读取数据)
+//   dev_ptr:  GPU 端地址 (传给 CUDA kernel)
+//   两者指向同一物理内存
 // ============================================================================
+bool cudaVoxelGridAllocZeroCopy(int max_points,
+                                VoxelPoint** host_ptr,
+                                VoxelPoint** dev_ptr) {
+  if (!host_ptr || !dev_ptr || max_points <= 0) return false;
+
+  size_t bytes = max_points * sizeof(VoxelPoint);
+  cudaError_t err = cudaHostAlloc(host_ptr, bytes, cudaHostAllocMapped);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "[CUDA] cudaHostAlloc failed: %s\n", cudaGetErrorString(err));
+    return false;
+  }
+
+  err = cudaHostGetDevicePointer(reinterpret_cast<void**>(dev_ptr), *host_ptr, 0);
+  if (err != cudaSuccess) {
+    fprintf(stderr, "[CUDA] cudaHostGetDevicePointer failed: %s\n",
+            cudaGetErrorString(err));
+    cudaFreeHost(*host_ptr);
+    *host_ptr = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+void cudaVoxelGridFreeZeroCopy(VoxelPoint* host_ptr) {
+  if (host_ptr) cudaFreeHost(host_ptr);
+}
+
+// ---- 兼容旧 API (保留但标记为 deprecated) ----
 VoxelPoint* cudaVoxelGridAllocManaged(int max_points) {
   VoxelPoint* ptr = nullptr;
   cudaError_t err = cudaMallocManaged(&ptr, max_points * sizeof(VoxelPoint));
